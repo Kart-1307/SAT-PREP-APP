@@ -75,7 +75,7 @@ QDRANT_COLLECTION="sat_question_bank"
 # Database (required)
 MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/satprep"
 
-# Analytics / Observability (optional)
+# Analytics / Observability
 LANGFUSE_SECRET_KEY="MY_LANGFUSE_SECRET_KEY"
 LANGFUSE_PUBLIC_KEY="MY_LANGFUSE_PUBLIC_KEY"
 LANGFUSE_BASE_URL="https://cloud.langfuse.com"
