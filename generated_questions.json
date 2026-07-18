@@ -1,0 +1,53 @@
+[
+  {
+    "id": "q-sat-733771",
+    "category": "Craft and Structure",
+    "passage": null,
+    "question": "In the mid-twentieth century, architectural critics often dismissed the Brutalist style as cold and utilitarian, arguing that its exposed concrete surfaces and rigid geometry were inherently unwelcoming. However, contemporary urban planners have begun to ______ this perspective, pointing out that the style's emphasis on open, communal spaces actually fosters a unique sense of social cohesion that more decorative, traditional buildings often lack.",
+    "choices": {
+      "A": "reassess",
+      "B": "codify",
+      "C": "disseminate",
+      "D": "mitigate"
+    },
+    "correct_answer": "A",
+    "explanation": "The context of the sentence establishes a contrast between the past dismissal of Brutalism and the current view held by urban planners. The word 'reassess' means to consider or judge something again, especially in a different way, which fits perfectly with the shift from negative criticism to a more positive, modern evaluation.",
+    "module": "Module 1",
+    "Section": "Reading_Writing",
+    "difficulty": "medium"
+  },
+  {
+    "id": "q-sat-743352",
+    "category": "Craft and Structure",
+    "passage": null,
+    "question": "Although the architect's initial design for the library was praised for its aesthetic appeal, the city council ultimately rejected it because the proposed construction costs were ______ the budget allocated for the project.",
+    "choices": {
+      "A": "far beyond",
+      "B": "well within",
+      "C": "identical to",
+      "D": "comparable to"
+    },
+    "correct_answer": "A",
+    "explanation": "The context of the sentence indicates that the city council 'rejected' the design. If the costs were within, identical to, or comparable to the budget, there would be no financial reason to reject the proposal. Therefore, the costs must have exceeded the budget, making 'far beyond' the most logical choice.",
+    "module": "Module 1",
+    "Section": "Reading_Writing",
+    "difficulty": "easy"
+  },
+  {
+    "id": "q-sat-635224",
+    "category": "Algebra",
+    "passage": null,
+    "question": "If 3(x - 4) = 2(x + 5) - 7, what is the value of x?",
+    "choices": {
+      "A": "15",
+      "B": "17",
+      "C": "3",
+      "D": "25"
+    },
+    "correct_answer": "A",
+    "explanation": "Distribute the constants: 3x - 12 = 2x + 10 - 7. Simplify the right side: 3x - 12 = 2x + 3. Subtract 2x from both sides: x - 12 = 3. Add 12 to both sides: x = 15.",
+    "module": "Module 1",
+    "Section": "Math",
+    "difficulty": "medium"
+  }
+]

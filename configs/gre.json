@@ -1,0 +1,161 @@
+{
+  "exam_type": "GRE",
+  "name": "GRE General Test",
+  "description": "Graduate Record Examination testing Verbal Reasoning, Quantitative Reasoning, and Analytical Writing.",
+  "sections": [
+    {
+      "name": "Verbal Reasoning",
+      "question_formats": [
+        "MCQ 5-option",
+        "Text Completion",
+        "Sentence Equivalence"
+      ],
+      "domains": [
+        {
+          "name": "Reading Comprehension",
+          "skills": [
+            "Analyze text structure",
+            "Retrieve specific details",
+            "Author attitude and tone"
+          ]
+        },
+        {
+          "name": "Text Completion",
+          "skills": [
+            "Single-blank completion",
+            "Double-blank completion",
+            "Triple-blank completion"
+          ]
+        },
+        {
+          "name": "Sentence Equivalence",
+          "skills": [
+            "Identify synonym pairs",
+            "Coherence under constraint"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Quantitative Reasoning",
+      "question_formats": [
+        "MCQ 5-option",
+        "Quantitative Comparison",
+        "Numeric Entry"
+      ],
+      "domains": [
+        {
+          "name": "Arithmetic",
+          "skills": [
+            "Integer properties",
+            "Fractions, decimals, and percents",
+            "Exponents and roots"
+          ]
+        },
+        {
+          "name": "Algebra",
+          "skills": [
+            "Linear equations",
+            "Quadratic equations and inequalities",
+            "Functions and coordinate geometry"
+          ]
+        },
+        {
+          "name": "Geometry",
+          "skills": [
+            "Lines and angles",
+            "Polygons and circles",
+            "Three-dimensional figures"
+          ]
+        },
+        {
+          "name": "Data Analysis",
+          "skills": [
+            "Descriptive statistics",
+            "Probability and counting methods",
+            "Data interpretation sets"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Analytical Writing (AWA)",
+      "question_formats": [
+        "Essay Prompt"
+      ],
+      "domains": [
+        {
+          "name": "Analyze an Issue",
+          "skills": [
+            "Constructing a cohesive argument",
+            "Providing persuasive evidence",
+            "Grammatical precision"
+          ]
+        }
+      ]
+    }
+  ],
+  "difficulty_scale": [
+    {
+      "label": "Easy",
+      "definition": "Simple recall, basic calculations, or direct reading checks."
+    },
+    {
+      "label": "Medium",
+      "definition": "Intermediate problem solving, simple double blank context, or multi-step math."
+    },
+    {
+      "label": "Hard",
+      "definition": "Calibrated to the hardest ~10% of REAL GRE Quant questions \u2014 NOT competition/olympiad math. Requires synthesizing 2-3 standard skills (algebra, arithmetic, basic geometry/stats \u2014 no calculus, no obscure theorems), a non-obvious first step, or resolving deliberately close distractors, while remaining solvable in roughly 90-120 seconds with clean numbers. Difficulty comes from reasoning/insight, not from computational grind or content outside the standard GRE curriculum."
+    }
+  ],
+  "style_rules": [
+    "Text Completion must have exactly 5 options for single blanks, or distinct options per blank.",
+    "Quantitative Comparison must present two quantities (Quantity A and Quantity B) and require comparing them.",
+    "Sentence Equivalence must require choosing EXACTLY TWO options that lead to equivalent and coherent sentence meanings."
+  ],
+  "validation_rubric": {
+    "min_composite_score": 90,
+    "zero_tolerance_checks": [
+      "correctness",
+      "originality"
+    ],
+    "checks": [
+      {
+        "id": "correctness",
+        "description": "Is the solution key or essay rubric completely verified?",
+        "weight": 25
+      },
+      {
+        "id": "distractor_quality",
+        "description": "Do distractors represent advanced logical fallacies or sophisticated math trap answers?",
+        "weight": 20
+      },
+      {
+        "id": "clarity",
+        "description": "Is the prompt free of ambiguity and grammatically pristine?",
+        "weight": 15
+      },
+      {
+        "id": "difficulty_alignment",
+        "description": "Is the difficulty calibrated to the graduate school standard?",
+        "weight": 10
+      },
+      {
+        "id": "domain_skill_alignment",
+        "description": "Does the question map directly to GRE competencies?",
+        "weight": 15
+      },
+      {
+        "id": "originality",
+        "description": "Is the content completely original and uncopied?",
+        "weight": 10
+      },
+      {
+        "id": "bias_sensitivity",
+        "description": "Is it fair to international graduate school applicants?",
+        "weight": 5
+      }
+    ]
+  }
+}

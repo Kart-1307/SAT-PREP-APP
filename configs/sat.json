@@ -1,0 +1,153 @@
+{
+  "exam_type": "SAT",
+  "name": "Digital SAT",
+  "description": "College Board Digital SAT exam testing Reading & Writing and Math.",
+  "sections": [
+    {
+      "name": "Reading and Writing",
+      "question_formats": [
+        "MCQ 4-option"
+      ],
+      "domains": [
+        {
+          "name": "Craft and Structure",
+          "skills": [
+            "Words in Context",
+            "Text Structure and Purpose",
+            "Cross-Text Connections"
+          ]
+        },
+        {
+          "name": "Information and Ideas",
+          "skills": [
+            "Central Ideas and Details",
+            "Command of Evidence",
+            "Inferences"
+          ]
+        },
+        {
+          "name": "Expression of Ideas",
+          "skills": [
+            "Rhetorical Synthesis",
+            "Transitions"
+          ]
+        },
+        {
+          "name": "Standard English Conventions",
+          "skills": [
+            "Boundaries",
+            "Form, Structure, and Sense"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Math",
+      "question_formats": [
+        "MCQ 4-option",
+        "Student-Produced Response"
+      ],
+      "domains": [
+        {
+          "name": "Algebra",
+          "skills": [
+            "Linear equations in one variable",
+            "Linear equations in two variables",
+            "Linear functions",
+            "Systems of two linear equations"
+          ]
+        },
+        {
+          "name": "Advanced Math",
+          "skills": [
+            "Equivalent expressions",
+            "Nonlinear equations in one variable",
+            "Nonlinear functions"
+          ]
+        },
+        {
+          "name": "Problem-Solving and Data Analysis",
+          "skills": [
+            "Ratios, rates, and proportional relationships",
+            "One-variable data distributions",
+            "Two-variable data models",
+            "Probability and conditional probability"
+          ]
+        },
+        {
+          "name": "Geometry and Trigonometry",
+          "skills": [
+            "Area and volume",
+            "Lines, angles, and triangles",
+            "Right triangles and trigonometry",
+            "Circles"
+          ]
+        }
+      ]
+    }
+  ],
+  "difficulty_scale": [
+    {
+      "label": "Easy",
+      "definition": "Direct, single-step questions testing fundamental rules or clear facts. Solvable in under 30 seconds by a student who knows the underlying rule."
+    },
+    {
+      "label": "Medium",
+      "definition": "Multi-step questions requiring analytical interpretation, simple translation, or combining 2-3 rules. Solvable in about 60-75 seconds with no unusual insight required."
+    },
+    {
+      "label": "Hard",
+      "definition": "Calibrated to the hardest ~10% of REAL Digital SAT questions (Math: the last 1-2 questions of a module) \u2014 NOT competition math or graduate-level content. A Hard question requires the student to synthesize 2-3 skills from the SAME curriculum used for Easy/Medium (Algebra I/II, Geometry, basic trig, stats \u2014 no calculus, no obscure theorems), spot a non-obvious first step, translate an unusually wordy or abstractly-framed scenario, or eliminate deliberately close/high-nuance distractors. It must remain solvable by a well-prepared high schooler in roughly 90-120 seconds by hand or with a basic calculator, using clean-ish numbers (no need for a page of algebra or ugly fractions/decimals). Difficulty must come from the REASONING/INSIGHT required, not from added computational grind, unfamiliar vocabulary/notation, extra variables for their own sake, or content outside the standard SAT Math curriculum."
+    }
+  ],
+  "style_rules": [
+    "Do not duplicate real official College Board questions or passages.",
+    "For Reading & Writing: Passages should be dense, academic, and between 50-150 words.",
+    "For Math: Stimulus can be word problems, linear/nonlinear system parameters, geometric descriptions, or function formulas.",
+    "Distractors must be highly plausible, capturing typical errors (e.g., sign errors, misinterpreting variables, using opposite transitions, or choosing partially correct answers)."
+  ],
+  "validation_rubric": {
+    "min_composite_score": 90,
+    "zero_tolerance_checks": [
+      "correctness",
+      "originality"
+    ],
+    "checks": [
+      {
+        "id": "correctness",
+        "description": "Is the marked correct answer mathematically or textually verified as 100% accurate?",
+        "weight": 25
+      },
+      {
+        "id": "distractor_quality",
+        "description": "Are distractors realistic, non-obvious, and derived from common student mistakes? Is there absolutely NO secondary defensible correct answer?",
+        "weight": 20
+      },
+      {
+        "id": "clarity",
+        "description": "Is the text grammatical, free of typos, and completely unambiguous?",
+        "weight": 15
+      },
+      {
+        "id": "difficulty_alignment",
+        "description": "Does the complexity match the requested easy/medium/hard definition?",
+        "weight": 10
+      },
+      {
+        "id": "domain_skill_alignment",
+        "description": "Does the question test the selected domain and skill specifically?",
+        "weight": 15
+      },
+      {
+        "id": "originality",
+        "description": "Does the question stand alone without copying existing bank items or copyrighted sources?",
+        "weight": 10
+      },
+      {
+        "id": "bias_sensitivity",
+        "description": "Is the question free of cultural, regional, socio-economic biases, and sensitive topics?",
+        "weight": 5
+      }
+    ]
+  }
+}
