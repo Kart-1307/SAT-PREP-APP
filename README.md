@@ -1,4 +1,4 @@
-﻿# SAT Agent Prep
+# SAT Agent Prep
 
 An AI-powered SAT question generation pipeline. A multi-agent system drafts, validates, and stages original SAT questions using RAG-augmented Claude generation, Gemini validation/embeddings, Qdrant vector search, and MongoDB storage.
 
@@ -15,6 +15,7 @@ An AI-powered SAT question generation pipeline. A multi-agent system drafts, val
 | **Embeddings** | Google Gemini Embedding API (`gemini-embedding-2-preview`, 768 dimensions) |
 | **Vector DB** | Qdrant Cloud — stores embedded question bank for semantic RAG retrieval |
 | **Database** | MongoDB Atlas — stores generated questions, audit logs, pipeline runs, RAG tracking |
+| **Observability** | Langfuse — LLM application tracing, cost tracking, and optimization analytics |
 | **Auth** | Firebase Authentication (Google sign-in) |
 | **Math Validation** | mathjs — deterministic equation verification without AI |
 | **PDF (scripts)** | pdfkit, pdf-parse, pdfjs-dist — reference scripts only, not part of main pipeline |
@@ -31,6 +32,7 @@ An AI-powered SAT question generation pipeline. A multi-agent system drafts, val
 - A [Qdrant Cloud](https://cloud.qdrant.io/) cluster (free tier)
 - A [MongoDB Atlas](https://www.mongodb.com/cloud/atlas) cluster (free tier)
 - A Firebase project with Authentication enabled
+- Optional: A [Langfuse](https://langfuse.com/) account for tracing and analytics
 
 ---
 
@@ -73,6 +75,11 @@ QDRANT_COLLECTION="sat_question_bank"
 # Database (required)
 MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/satprep"
 
+# Analytics / Observability (optional)
+LANGFUSE_SECRET_KEY="MY_LANGFUSE_SECRET_KEY"
+LANGFUSE_PUBLIC_KEY="MY_LANGFUSE_PUBLIC_KEY"
+LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+
 # ─────────────────────────────────────────────────────────────
 # LOCAL DEVELOPMENT (interns): you only need MONGODB_URI.
 # Leave ANTHROPIC_API_KEY / GEMINI_API_KEY / QDRANT_* unset to run in
@@ -81,6 +88,14 @@ MONGODB_URI="mongodb+srv://user:pass@cluster.mongodb.net/satprep"
 ```
 
 Firebase client variables (`VITE_FIREBASE_*`) are also required for auth — see `.env.example` for the full list.
+
+---
+
+## Startup Connection Pool Warming
+
+To ensure that the app starts up responsively:
+1. **MongoDB Connection Warming**: The MongoDB client establishes its connection pool synchronously at boot (`server.ts` startup), preventing early request timeouts or lag during the initial API calls.
+2. **Qdrant Collection Status Check**: The system validates that the Math and Reading collections exist in Qdrant and reports the loaded question counts at boot.
 
 ---
 
@@ -126,7 +141,13 @@ User selects: exam / section / domain / skill / difficulty
    Exceeded max attempts → escalated to human review queue in the UI
 ```
 
-### Batch Generation
+### Pre-Validation: Deterministic Math Sanity Check
+
+If the generator produces a question containing a structured verification block (`equation_lhs`, `equation_rhs`, `variable`, `variable_value` in metadata), the pipeline executes a pre-validation check using **mathjs** instead of an LLM. It substitutes the variable value back into the equation LHS and RHS and checks for mathematical equivalence. If they do not match, the question fails immediately. If no structured verification block is provided (e.g. word problems, geometry), the check is skipped and correctness is evaluated in the Validator Agent step.
+
+---
+
+## Batch Generation & Stop Logic
 
 Batch mode ("Generate All Combinations") builds the full cross-product of every section × domain × skill × difficulty in the exam's config, then runs each combination through **the exact same pipeline above** — same RAG rotation, same pre-validation filters, same Validator Agent, same retry/escalation logic. It is a sequential orchestration wrapper, not a separate generation path.
 
@@ -138,6 +159,64 @@ Batch results distinguish three outcomes per item, tracked separately (not lumpe
 **Batch scope** can be either:
 - **All Combinations** — the full cross-product of every section × domain × skill × difficulty in the exam config (original behavior).
 - **Custom Selection** — a multi-select subset. You can pick 1+ sections, 1+ domains (unioned across every selected section), 1+ skills (unioned across every selected domain), and 1+ difficulties; the batch then runs the cross-product of just that subset. All four fields are required in custom scope — there is no partial/implicit "rest = all" fallback.
+
+### In-Progress Stopping and Cancellation
+When stopping a batch run via `/api/batch-runs/:batch_id/stop`:
+1. The batch state is set to `stop_requested`, which prevents workers from starting new combinations.
+2. The stop command is **propagated down** to any currently in-flight single-question pipelines, terminating active LLM loops gracefully within the current attempt instead of leaving workers processing items for up to 2 minutes.
+
+---
+
+## Regeneration & Human Review
+
+The platform provides dedicated API endpoints and frontend controls to handle questions that fail automated scoring or require manual corrections.
+
+### Single Question Regeneration
+For questions marked as `rejected` in the system, administrators can trigger a regeneration via:
+`POST /api/questions/:question_id/regenerate`
+- This endpoint extracts all review notes (automated pipeline failure feedback, human reviewer comments, override justifications, checklist flags).
+- It compiles them into an `initialFeedback` instruction (e.g., *"This question was previously rejected because... Generate a new question that addresses this feedback..."*).
+- The pipeline runs attempt 1 seeded with this instruction instead of starting blind, allowing the generator to produce a compliant replacement.
+
+### Batch Generation from CSV / Upload
+If you have custom metadata lists of rejected questions from external sources, you can generate replacement batches via:
+`POST /api/questions/generate-batch-from-upload`
+- Takes an array of raw questions, categories, reviewer notes, and manual checklist comments.
+- Maps their sections, domains, skills, and difficulties to the active exam config structure.
+- Resolves all reviewer notes, checklists, and manual override comments into a detailed feedback prompt for each entry.
+- Triggers a batch run queue that generates replacements for each uploaded item using the same RAG and validation pipeline.
+
+---
+
+## LLM Prompt Caching & Token Optimization
+
+To make generation cost-effective and resilient under high load, the Generator Agent employs the following strategies:
+
+### Anthropic Prompt Caching
+The prompt structure is split into two components:
+1. **Static Prompt** (Cached): Contains exam specifications, RAG exemplar context, and the JSON output schema/rules. This block is marked with a `cache_control` ephemeral breakpoint.
+2. **Dynamic Trailer** (Uncached): Contains the specific instructions to generate exactly $N$ questions. 
+By caching the static block, subsequent calls in the same batch or matching domains benefit from Anthropic's **90% discount on cache-read input tokens**, with only the dynamic suffix invalidating cache blocks.
+
+### SDK-Level Timeout and Retry Optimization
+In single/batch generation calls, the generator instructs the Anthropic SDK with `{ timeout: 45000, maxRetries: 0 }`. 
+- Skipping internal SDK retries prevents slow or rate-limited requests from stack-multiplying internally (e.g. 3 attempts × 45s), which would blow past the batch item's 120s budget.
+- This lets the outer orchestration pipeline handle backoffs and retry feedback loops explicitly and gracefully.
+
+### Langfuse Tracing
+All LLM generation and validation trace calls log detailed metadata to Langfuse. To ensure billing accuracy, token metrics are sent using Langfuse's exact `usageDetails` API, splitting tokens into:
+- `input` (raw prompt tokens)
+- `output` (generated tokens)
+- `cache_creation_input_tokens` (costing +25% one-time write charge)
+- `cache_read_input_tokens` (costing -90% read charge)
+
+---
+
+## Math Difficulty Calibration
+
+Difficulty tags in SAT exams are strictly calibrated to avoid common generator errors:
+- **"Hard" Math Calibration**: Hard questions must not use college-level curricula (e.g., calculus, obscure advanced trigonometry, multi-page algebraic derivations, ugly numbers). Rather, difficulty is introduced through multi-step reasoning, combining 2-3 standard topics (Algebra I/II, Geometry, basic stats/trig), or wordy, abstract framing.
+- **Graph & Figure Questions**: Since the system does not use visual graphics in raw pipeline outputs, graph-based questions are textually simulated in the `stimulus` field (e.g., *"Line k passes through points (-2, 5) and (4, -1)..."*), allowing algebraic reconstruction.
 
 ---
 
@@ -158,6 +237,7 @@ Batch results distinguish three outcomes per item, tracked separately (not lumpe
 │       ├── pipeline.ts                    Orchestration loop: RAG → generate → validate → save; batch wrapper
 │       ├── formatter.ts                   Converts internal Question → staging export format
 │       ├── mathSanityCheck.ts             Deterministic math verifier using mathjs (no AI)
+│       ├── langfuse.ts                    Langfuse client manager (observability tracer)
 │       └── agents/
 │           ├── generatorAgent.ts          Builds prompts and calls Claude to generate questions
 │           └── validatorAgent.ts          Calls Gemini to independently score generated questions
@@ -265,9 +345,13 @@ No other changes needed.
 | `POST` | `/api/questions/generate-batch` | Trigger batch generation. Body: `exam_type` (required), optional `sections`/`domains`/`skills`/`difficulties` string arrays to filter to a subset instead of the full cross-product |
 | `GET` | `/api/batch-runs` | List batch runs (filterable by `exam_type`, `status`) |
 | `GET` | `/api/batch-runs/:id` | Poll a specific batch run's progress |
+| `POST` | `/api/batch-runs/:batch_id/stop` | Request to stop an in-progress batch generation. Propagates down to cancel active items. |
 | `POST` | `/api/questions/review` | Approve / reject / edit a question |
+| `POST` | `/api/questions/:question_id/regenerate` | Send a rejected question back for generation, seeded with feedback. |
+| `POST` | `/api/questions/generate-batch-from-upload` | Trigger custom batch generation from uploaded questions requiring reviews. |
 | `GET` | `/api/questions/export` | Export in staging format (`?id=` for single, bulk otherwise) |
 | `GET` | `/api/audit-logs` | All validation audit logs |
 | `GET` | `/api/pipeline-runs` | Live pipeline run states |
+| `POST` | `/api/pipeline-runs/:question_id/stop` | Stop/cancel a single in-flight pipeline run attempt. |
 | `GET` | `/api/configs/:exam` | Exam config (sat / gre) |
 | `POST` | `/api/reset` | Export → wipe → re-seed → clear RAG tracking |
