@@ -179,7 +179,7 @@ export async function runSimilarityCheck(
   examType: string,
   userId?: string
 ): Promise<{ similarity_score: number; similar_question_id: string | null; embedding?: number[] }> {
-  const existingQuestions = await Database.getQuestions({ exam_type: examType });
+  const existingQuestions = await Database.getQuestions({ exam_type: examType, includeEmbeddings: true });
   if (existingQuestions.length === 0) {
     return { similarity_score: 0, similar_question_id: null };
   }
@@ -864,7 +864,7 @@ export async function runOrchestrationPipeline(params: {
 }): Promise<Question> {
   const { exam_type, section, domain, skill_tag, difficulty, config, userId } = params;
   const max_attempts = params.max_attempts || config.validation_rubric.max_attempts || 3;
-  const qId = `q-${exam_type.toLowerCase()}-${Date.now().toString().slice(-6)}`;
+  const qId = `q-${exam_type.toLowerCase()}-${uuidv4().slice(0, 8)}`;
 
   const run: PipelineRun = {
     question_id: qId,
@@ -1089,15 +1089,13 @@ export async function runOrchestrationPipeline(params: {
         : `Validator passed the question but it failed the completeness gate — ${finalCompleteness.reason}`;
       await addLog("decision", `Attempt ${currentAttempt} FAILED validation. Actionable feedback: "${failureReason}"`);
       
-      // Save the failed attempt to the database with a unique ID and status 'escalated'
-      const failedQuestion: Question = {
-        ...draftQuestion,
-        question_id: `${qId}-att${currentAttempt}`,
-        status: "escalated",
-        generation_attempt: currentAttempt
-      };
-      await Database.saveQuestion(failedQuestion);
-      
+      // NOTE: we intentionally do NOT write this failed attempt to the
+      // questions collection. It's already fully captured in audit_logs
+      // (see addAuditLog above). Writing it here as well used to create a
+      // duplicate/extra document for every failed attempt — inflating the
+      // Live Question Bank count for combos that eventually succeeded, and
+      // creating a literal duplicate (this doc + the final escalated save
+      // below) for combos that ultimately got escalated.
       lastFeedback = failureReason;
       currentAttempt++;
     }

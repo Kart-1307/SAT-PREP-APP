@@ -19,6 +19,14 @@ export class Database {
     domain?: string;
     status?: "approved" | "rejected" | "escalated";
     limit?: number;
+    // Embedding vectors (768-3072 floats per question) are only needed by
+    // the similarity-check step. Every other caller — including the
+    // frontend's polling GET /api/questions, hit every 0.8-1.5s while
+    // generation is running — was pulling this huge payload for every
+    // question in the bank on every single tick, which is what made the
+    // tab lock up / "Not Responding" as the bank grew. Default to excluding
+    // it; only runSimilarityCheck opts in.
+    includeEmbeddings?: boolean;
   }): Promise<Question[]> {
     const db = await getDb();
     const query: any = {};
@@ -26,9 +34,13 @@ export class Database {
     if (filters?.section) query.section = filters.section;
     if (filters?.domain) query.domain = filters.domain;
     if (filters?.status) query.status = filters.status;
+    const options: any = {};
+    if (!filters?.includeEmbeddings) {
+      options.projection = { embedding: 0 };
+    }
     // No limit by default (exports/reset need the full set) — callers on a
     // tight polling loop should pass an explicit limit to keep payloads small.
-    let cursor = db.collection(QUESTIONS_COL).find(query);
+    let cursor = db.collection(QUESTIONS_COL).find(query, options);
     if (filters?.limit) cursor = cursor.limit(filters.limit);
     const docs = await cursor.toArray();
     return docs as unknown as Question[];

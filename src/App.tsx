@@ -104,6 +104,13 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [domainFilter, setDomainFilter] = useState<string>("all");
+  // Bank tab was rendering every matching question's full card (passage,
+  // choices, QA audit grid, explanation) all at once — with a few thousand
+  // approved questions that's a huge DOM tree and is what locks up the tab
+  // on open. Render one page at a time instead; nothing about the
+  // underlying data or fetch logic changes, this is display-only.
+  const BANK_PAGE_SIZE = 25;
+  const [bankPage, setBankPage] = useState(0);
 
   // Human Review states
   const [reviewQuestion, setReviewQuestion] = useState<Question | null>(null);
@@ -538,8 +545,14 @@ export default function App() {
             if (comboKey !== trackedBatchComboRef.current) {
               // Batch moved to a new item — clear immediately instead of
               // leaving the previous item's finished logs on screen.
+              // Skip this when the batch has already finished: comboKey
+              // also goes null on that final tick, and nulling here caused
+              // a one-frame flash before the completion block below
+              // re-populated selectedRun with the last run.
               trackedBatchComboRef.current = comboKey;
-              setSelectedRun(null);
+              if (data.status === "running") {
+                setSelectedRun(null);
+              }
             }
 
             if (currentItem) {
@@ -1035,6 +1048,20 @@ export default function App() {
 
   const escalatedQuestions = questions.filter((q: Question) => q.status === "escalated");
 
+  // Reset to page 1 whenever the filtered result set changes (new search,
+  // new filter, or the underlying data refreshing from a poll) so you're
+  // never silently stuck on a now-out-of-range page.
+  useEffect(() => {
+    setBankPage(0);
+  }, [searchQuery, statusFilter, domainFilter]);
+
+  const bankPageCount = Math.max(1, Math.ceil(filteredQuestions.length / BANK_PAGE_SIZE));
+  const currentBankPage = Math.min(bankPage, bankPageCount - 1);
+  const paginatedBankQuestions = useMemo(
+    () => filteredQuestions.slice(currentBankPage * BANK_PAGE_SIZE, (currentBankPage + 1) * BANK_PAGE_SIZE),
+    [filteredQuestions, currentBankPage]
+  );
+
   // Calculate QA stats
   const totalLogs = auditLogs.length;
   const passedLogs = auditLogs.filter((l: ValidationAuditLog) => l.validation_status === "PASS").length;
@@ -1461,7 +1488,7 @@ export default function App() {
               <DbIcon className="w-4 h-4" />
               Live Question Bank
               <span className="ml-auto bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold">
-                {questionsLoaded ? questions.length : "–"}
+                {questionsLoaded ? questions.filter((q: Question) => q.status === "approved" || q.status === "escalated").length : "–"}
               </span>
             </button>
 
@@ -2057,7 +2084,7 @@ export default function App() {
                 <div className="lg:col-span-8 flex flex-col gap-5">
 
                   {/* Batch generation progress */}
-                  {activeBatchRun && (specMode === "combinations" || specMode === "upload") && (
+                  {activeBatchRun && (
                     <div className="bg-white border border-slate-200/80 shadow-sm rounded-2xl p-5">
                       <div className="flex items-center justify-between border-b border-slate-150 pb-3 mb-4">
                         <div className="flex items-center gap-2">
@@ -2355,7 +2382,7 @@ export default function App() {
                 {/* QUESTIONS LIST */}
                 {filteredQuestions.length > 0 ? (
                   <div className="flex flex-col gap-4">
-                    {filteredQuestions.map((q) => (
+                    {paginatedBankQuestions.map((q) => (
                       <div
                         key={q.question_id}
                         className="bg-white border border-slate-200/85 hover:border-slate-300 rounded-2xl p-5 flex flex-col gap-4 transition shadow-sm"
@@ -2478,6 +2505,36 @@ export default function App() {
                   <div className="flex flex-col items-center justify-center py-20 text-slate-400 border border-dashed border-slate-200 rounded-2xl bg-white shadow-sm">
                     <DbIcon className="w-8 h-8 mb-2 text-slate-400" />
                     <p className="text-xs font-semibold text-slate-600">No questions matched the filter criteria in the live bank.</p>
+                  </div>
+                )}
+
+                {/* PAGINATION CONTROLS */}
+                {filteredQuestions.length > BANK_PAGE_SIZE && (
+                  <div className="flex items-center justify-between bg-white border border-slate-200/80 shadow-sm rounded-2xl px-4 py-3">
+                    <span className="text-xs text-slate-500">
+                      Showing <span className="font-semibold text-slate-700">{currentBankPage * BANK_PAGE_SIZE + 1}</span>
+                      –<span className="font-semibold text-slate-700">{Math.min((currentBankPage + 1) * BANK_PAGE_SIZE, filteredQuestions.length)}</span>
+                      {" "}of <span className="font-semibold text-slate-700">{filteredQuestions.length}</span> questions
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => setBankPage(p => Math.max(0, p - 1))}
+                        disabled={currentBankPage === 0}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                      >
+                        Previous
+                      </button>
+                      <span className="text-xs text-slate-500 font-mono">
+                        Page {currentBankPage + 1} / {bankPageCount}
+                      </span>
+                      <button
+                        onClick={() => setBankPage(p => Math.min(bankPageCount - 1, p + 1))}
+                        disabled={currentBankPage >= bankPageCount - 1}
+                        className="px-3 py-1.5 rounded-lg text-xs font-semibold border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                      >
+                        Next
+                      </button>
+                    </div>
                   </div>
                 )}
               </motion.div>
