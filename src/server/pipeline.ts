@@ -1009,20 +1009,17 @@ export async function runOrchestrationPipeline(params: {
       continue;
     }
 
-    // Step 2b: Deterministic Math Sanity Check (Math questions only, no AI involved)
-    const sectionLower = draftQuestion.section.toLowerCase();
-    if (sectionLower.includes("math") || sectionLower.includes("quant")) {
-      const mathCheck = runMathSanityCheck(draftQuestion);
-      if (mathCheck.skipped) {
-        await addLog("pre_filter", "Math Sanity Check: SKIPPED (no structured equation provided — deferring to Validator).");
-      } else if (!mathCheck.passed) {
-        await addLog("pre_filter", `Math Sanity Check: FAIL — ${mathCheck.reason}`);
-        lastFeedback = mathCheck.reason;
-        currentAttempt++;
-        continue;
-      } else {
-        await addLog("pre_filter", "Math Sanity Check: PASS — computed answer matches claimed correct_answer.");
-      }
+    // Step 2b: Deterministic Sanity Check (Pre-Validation Filter)
+    const mathCheck = runMathSanityCheck(draftQuestion);
+    if (!mathCheck.passed) {
+      await addLog("pre_filter", `Math & Choice Sanity Check: FAIL — ${mathCheck.reason}`);
+      lastFeedback = mathCheck.reason;
+      currentAttempt++;
+      continue;
+    } else if (mathCheck.skipped) {
+      await addLog("pre_filter", "Math & Choice Sanity Check: SKIPPED (no exact computed answer provided — deferring to Validator).");
+    } else {
+      await addLog("pre_filter", "Math & Choice Sanity Check: PASS — computed answer matches claimed correct_answer.");
     }
     
     // Step 3: Similarity check (before validator)
@@ -1035,13 +1032,28 @@ export async function runOrchestrationPipeline(params: {
     }
 
     if (simResult.similarity_score > 0.85) {
-  await addLog("pre_filter", `Pre-Validation Warning: High similarity detected (${simResult.similarity_score}) with question ${simResult.similar_question_id}. Forcing regeneration.`);
-  lastFeedback = `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). You MUST generate a completely different question with a new scenario, different numbers, and different wording.`;
-  currentAttempt++;
-  continue;
-} else {
-  await addLog("pre_filter", `Pre-Validation PASS: Originality check completed (similarity score ${simResult.similarity_score}).`);
-}
+      await addLog("pre_filter", `Pre-Validation Warning: High similarity detected (${simResult.similarity_score}) with question ${simResult.similar_question_id}. Forcing regeneration.`);
+      lastFeedback = `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). You MUST generate a completely different question with a new scenario, different numbers, and different wording.`;
+      currentAttempt++;
+      continue;
+    } else {
+      await addLog("pre_filter", `Pre-Validation PASS: Originality check completed (similarity score ${simResult.similarity_score}).`);
+    }
+
+    // Step 3b: Structured Debug Logging
+    const choiceMap = Object.fromEntries(
+      (draftQuestion.answer_choices || []).map(c => [`option_${c.id}`, c.text])
+    );
+    console.log("[Pipeline Step Log]", JSON.stringify({
+      computed_answer: draftQuestion.metadata?.exam_specific?.exact_computed_answer ?? "N/A",
+      option_A: choiceMap["option_A"] || "",
+      option_B: choiceMap["option_B"] || "",
+      option_C: choiceMap["option_C"] || "",
+      option_D: choiceMap["option_D"] || "",
+      stored_correct_answer: draftQuestion.correct_answer,
+      explanation_final_answer: draftQuestion.explanation?.correct_rationale ? draftQuestion.explanation.correct_rationale.slice(0, 150) : "",
+      sanity_check_result: mathCheck.passed ? (mathCheck.skipped ? "SKIPPED" : "PASS") : "FAIL"
+    }, null, 2));
 
     // Step 4: Independent Validation
     const validationBlock = await runValidatorAgent({
@@ -1218,7 +1230,7 @@ export async function createBatchRun(params: {
 // is purely an orchestration wrapper, not a separate generation path).
 // Intended to be invoked without awaiting from the API route ("fire and forget"),
 // with progress persisted to MongoDB after every item so the UI can poll it.
-const BATCH_CONCURRENCY = 3;
+const BATCH_CONCURRENCY = 6;
 const BATCH_ITEM_TIMEOUT_MS = 120000;
 
 export async function processBatchRun(params: {

@@ -122,7 +122,6 @@ async function generateContentWithRetry(params: {
     } else {
       console.warn(`[Generator] Generation failed: ${err?.message || err}`);
     }
-    // Let the caller (pipeline) fall back to simulated mode on any hard failure.
     throw err;
   }
 }
@@ -147,13 +146,6 @@ Correct: ${ex.correct_answer}`;
 // ═══════════════════════════════════════════════════════════
 // HELPER FUNCTION 1b: Detect graph-relevant Math domain/skill
 // ═══════════════════════════════════════════════════════════
-// There's no image-rendering pipeline on the frontend (questions render as
-// plain text), so "graph questions" here means: the model must build a
-// precise, fully text-described coordinate-plane/graph/scatterplot scenario
-// in "stimulus" that a student can reason about without seeing a picture —
-// not literally emit an image. This just detects when that style of
-// question is a natural fit for the requested domain/skill so we can nudge
-// the model toward it instead of defaulting to purely algebraic phrasing.
 const GRAPH_KEYWORDS = [
   'graph', 'linear function', 'linear equation', 'quadratic', 'exponential',
   'polynomial', 'scatterplot', 'scatter plot', 'system of equations',
@@ -166,146 +158,27 @@ function isGraphRelevantSkill(domain: string, skill: string): boolean {
   return GRAPH_KEYWORDS.some(kw => haystack.includes(kw));
 }
 
-// ═══════════════════════════════════════════════════════════
-// HELPER FUNCTION 2: Build System Prompt (batch-aware)
-// ═══════════════════════════════════════════════════════════
-function buildSystemPromptForGenerator(subject: string, examType: string): string {
-  const base = `You are an expert ${examType} ${subject === 'Math' ? 'Math' : 'English/Reading'} question generator.
-Respond with ONLY a single valid JSON array — no markdown fences, no commentary, no trailing text.
-Each element of the array must strictly follow the schema provided by the user.`;
-
-  if (subject === 'Math') {
-    return `${base}
-Rules (apply to EVERY question in the array):
-- Exactly 4 answer choices labelled A, B, C, D
-- Exactly one correct answer
-- All numbers and expressions must be mathematically accurate
-- Distractors should reflect common student errors
-- Questions should be unique and of very very high quality to the real examination type questions
-- No two questions in the array may be near-duplicates of each other — vary the numbers, contexts, and phrasing
-
-CALIBRATION — this is the most common failure mode, read carefully:
-"Hard" on a real exam is NOT competition math, and it is NOT graduate-level math. It does not require calculus,
-obscure theorems/identities, contrived multi-page algebra, deliberately ugly numbers, or notation outside the
-standard high-school curriculum. A genuinely hard exam question uses the exact same toolbox as an easy one
-(Algebra I/II, Geometry, basic trig/stats) — the difficulty comes from requiring the student to combine 2-3 of
-those skills, spot a non-obvious first move, or navigate a wordier/more abstractly-framed setup, while still
-being solvable by hand or basic calculator in about 90-120 seconds. If you find yourself reaching for content a
-typical high schooler has never seen, or the arithmetic itself is the hard part, that is miscalibrated — simplify
-the numbers/content and add reasoning depth instead. When difficulty = "Hard", follow the difficulty definition
-given in the user prompt precisely rather than defaulting to "as hard as possible."
-
-GRAPH / FIGURE QUESTIONS — there is no image renderer, so a "graph question" means the graph itself is fully
-specified in words inside "stimulus," precisely enough that a student can reconstruct or reason about it with zero
-ambiguity, exactly like a table-of-values or a defined function would be. When the domain/skill is graph-relevant
-(e.g. linear/quadratic/exponential functions, systems of equations, scatterplots, circles, coordinate geometry),
-prefer building the question around one of these instead of defaulting to pure symbol manipulation:
-- A line or curve in the xy-plane: give it either as an equation, OR as a fully-described graph — e.g. "line k passes
-  through the points (-2, 5) and (4, -1)" or "the graph of f is a parabola with vertex (3, -4) that opens upward and
-  passes through (5, 0)."
-- A scatterplot/data-in-a-graph: describe it as a small labelled table of (x, y) pairs plus, if relevant, the trend
-  ("the data show an approximately linear relationship with a positive slope") — never say "as shown in the graph"
-  without giving the actual values, since the student cannot see anything you didn't write out.
-- A system graphed as two lines/curves: describe both precisely enough to find the intersection(s) if asked.
-Never reference a figure, image, or graph the reader can't see ("the graph shown," "as pictured above") — every
-number, point, label, and axis scale the student needs must be spelled out in "stimulus" itself.`;
-  }
-  return `${base}
-Rules (apply to EVERY question in the array):
-- Exactly 4 answer choices labelled A, B, C, D
-- Exactly one correct answer
-- Test reading comprehension, vocabulary, or grammar as appropriate
-- Distractors should be plausible but clearly incorrect
-- Questions should be unique and of very very high quality to the real examination type questions
-- No two questions in the array may be near-duplicates of each other — vary the topics, contexts, and phrasing`;
+// Interfaces for decoupled stages
+interface ScenarioDraft {
+  passage: string | null;
+  stimulus: string | null;
+  question_text: string;
 }
 
-// ═══════════════════════════════════════════════════════════
-// HELPER FUNCTION 3: Build User Prompt (batch-aware, cache-split)
-// ═══════════════════════════════════════════════════════════
-// Split in two so the (large) invariant part can be sent as a cacheable
-// content block:
-//   - buildStaticUserPromptForGenerator: specs + exemplars + schema/field
-//     rules. Does NOT mention `count` anywhere, so it is byte-for-byte
-//     identical across every chunk of one batch call (chunkSize 1..N) —
-//     this is the block we put behind a cache_control breakpoint.
-//   - buildDynamicCountTrailer: the only part that changes per chunk (how
-//     many questions to actually produce this call). Kept tiny and
-//     uncached so it never busts the cache above it.
-function buildStaticUserPromptForGenerator(params: {
-  subject: string;
-  domain: string;
-  skill: string;
-  difficulty: string;
-  difficultyDefinition?: string;
-  studentLevel?: string;
-  feedback?: string;
-  examType: string;
-}, exemplarContext: string): string {
-  const exemplarSection = exemplarContext
-    ? `\nSTYLE REFERENCE (similar difficulty/skill — do NOT copy, just match style):\n${exemplarContext}\n`
-    : '';
-
-  const feedbackSection = params.feedback
-    ? `\nCRITICAL: A previous generation attempt failed validation with the following feedback:\n"${params.feedback}"\nYou MUST address this feedback, correct any errors, and ensure the new questions are high quality and completely free of the reported issues.\n`
-    : '';
-
-  const difficultyLine = params.difficultyDefinition
-    ? `- Difficulty: ${params.difficulty} — ${params.difficultyDefinition}`
-    : `- Difficulty: ${params.difficulty}`;
-
-  const graphSection = (params.subject === 'Math' && isGraphRelevantSkill(params.domain, params.skill))
-    ? `\nThis domain/skill naturally supports graph-based items. Include a healthy mix: at least some questions should center on a coordinate-plane graph, function graph, or scatterplot described in full detail inside "stimulus" (per the GRAPH / FIGURE QUESTIONS rules above), rather than making every question purely symbolic/algebraic.\n`
-    : '';
-
-  return `You will generate NEW, ORIGINAL, and DISTINCT ${params.examType} ${params.subject} questions.
-${feedbackSection}
-Specifications (apply to every question):
-- Domain: ${params.domain}
-- Skill: ${params.skill}
-${difficultyLine}${params.studentLevel ? `\n- Student Level: ${params.studentLevel}` : ''}
-${graphSection}${exemplarSection}
-Each question must be a JSON object shaped exactly like this:
-{
-  "question_id": "gen_1",
-  "exam": "${params.examType}",
-  "subject": "${params.subject}",
-  "domain": "${params.domain}",
-  "skill": "${params.skill}",
-  "difficulty": "${params.difficulty}",
-  "passage": "... or null",
-  "stimulus": "... or null",
-  "question_text": "...",
-  "answer_choices": [
-    {"choice_id": "A", "choice_text": "..."},
-    {"choice_id": "B", "choice_text": "..."},
-    {"choice_id": "C", "choice_text": "..."},
-    {"choice_id": "D", "choice_text": "..."}
-  ],
-  "correct_answer": "A",
-  "explanation": "..."
-}
-Field rules for "passage" vs "stimulus" vs "question_text":
-- "passage": a full reading passage the question is based on (Reading & Writing comprehension items). Use null if the item is a short standalone text-completion/grammar item where the sentence itself IS the question_text.
-- "stimulus": any shared context the question refers to but that is NOT itself the question being asked — e.g. an equation, a defined function like "C(h) = 35h + 50", a data table, or a described graph/scenario. Use null only if the question is fully self-contained inside question_text (e.g. "If 3(x-4)=2(x+5)-7, what is x?").
-- "question_text": the actual question being asked. When a "stimulus" is present, question_text should reference it (e.g. "According to the function, what does 35 represent?") rather than repeating it.`;
+interface SolvedScenario {
+  exact_computed_answer: string;
+  step_by_step_solution: string;
+  explanation: string;
 }
 
-function buildDynamicCountTrailer(count: number): string {
-  return `Now generate exactly ${count} such question(s), each internally consistent and non-repetitive relative to the others.
-Respond with ONLY a JSON array of exactly ${count} objects — no markdown fences, no commentary, no trailing text.
-Return: [ {...}, {...}, ... ] — exactly ${count} elements.`;
+interface WrongChoices {
+  distractors: Array<{
+    choice_text: string;
+    rationale: string;
+  }>;
 }
 
-// ═══════════════════════════════════════════════════════════
-// HELPER FUNCTION 4: Robust JSON extraction & repair
-// Now array-aware: prefers the outer [ ... ], falls back to
-// wrapping a single { ... } object in an array.
-// ═══════════════════════════════════════════════════════════
-// Finds the index of the bracket that actually closes the one at
-// `startIdx` (i.e. proper depth-matching, ignoring bracket-like
-// characters that appear inside string values). Returns -1 if the
-// text is truncated mid-structure and no matching close exists.
+// Helper to match brackets for robust JSON cleanup
 function findMatchingEnd(text: string, startIdx: number): number {
   const openCh = text[startIdx];
   const closeCh = openCh === '[' ? ']' : '}';
@@ -326,6 +199,7 @@ function findMatchingEnd(text: string, startIdx: number): number {
   return -1;
 }
 
+// Extracts valid JSON from model responses by matching brackets and repairing quotes/braces
 function extractJSON(raw: string): string {
   let text = raw
     .replace(/^```json\s*/i, '')
@@ -333,14 +207,6 @@ function extractJSON(raw: string): string {
     .replace(/```\s*$/i, '')
     .trim();
 
-  // Walk forward from the opening bracket and find the bracket that
-  // ACTUALLY closes it (respecting strings/escapes), instead of blindly
-  // grabbing the last '[' / '{' in the whole response. Using lastIndexOf
-  // is what caused the intermittent "Unexpected non-whitespace character
-  // after JSON" errors: if the model appends any trailing text containing
-  // a stray ']' or '}' (commentary, a duplicated element, an interval like
-  // "[0, 100]" inside an explanation), lastIndexOf would grab that instead
-  // of the true end of the array, pulling in trailing garbage.
   const arrStart = text.indexOf('[');
   const objStart = text.indexOf('{');
 
@@ -356,11 +222,6 @@ function extractJSON(raw: string): string {
     text = end !== -1 ? text.slice(objStart, end + 1) : text.slice(objStart);
   }
 
-  // Replace smart/curly quotes with straight quotes — but only outside
-  // string values. A blind global replace turns a curly quote that's part
-  // of a passage's own text (e.g. quoting a word) into a bare unescaped "
-  // in the middle of a JSON string, which breaks parsing. Inside a string,
-  // convert to an escaped \" instead so the JSON stays valid.
   {
     let result = '';
     let inStr = false, esc = false;
@@ -387,13 +248,10 @@ function extractJSON(raw: string): string {
     else if (ch === ']') brackets--;
   }
 
-  // If truncated mid-element inside an array, drop the last
-  // incomplete element before closing, so JSON.parse doesn't choke.
   if (isArray && braces > 0) {
     const lastCompleteObjEnd = text.lastIndexOf('}');
     if (lastCompleteObjEnd !== -1) {
       text = text.slice(0, lastCompleteObjEnd + 1);
-      // recount braces after trimming
       braces = 0; brackets = 0; inString = false; escape = false;
       for (const ch of text) {
         if (escape) { escape = false; continue; }
@@ -418,38 +276,228 @@ function extractJSON(raw: string): string {
   return text;
 }
 
-function buildQuestionFromParsed(
-  parsed: any,
-  params: { subject: string; domain: string; skill: string; difficulty: string; examType: string; },
+// Generic JSON execution helper using Claude API
+async function callClaudeJSON<T>(systemPrompt: string, userPrompt: string, temperature = 0.2): Promise<T> {
+  const staticPrompt = userPrompt;
+  const dynamicPrompt = "Respond with ONLY a single valid JSON object. Do not include markdown formatting, backticks, or wrapping other than the JSON itself.";
+
+  const response = await generateContentWithRetry({
+    staticPrompt,
+    dynamicPrompt,
+    systemPrompt,
+    temperature,
+    maxOutputTokens: 2048,
+  });
+
+  const rawText = Array.isArray(response?.content)
+    ? response.content
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text)
+      .join('')
+    : '';
+
+  if (!rawText) {
+    throw new Error('[Generator] Received empty response from Claude API.');
+  }
+
+  const jsonText = extractJSON(rawText);
+  try {
+    return JSON.parse(jsonText) as T;
+  } catch (err) {
+    console.error('[Generator] JSON parse failed inside callClaudeJSON. Raw text:', rawText);
+    console.error('[Generator] Extracted JSON text:', jsonText);
+    throw err;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
+// DECOUPLED STAGES
+// ═══════════════════════════════════════════════════════════
+
+// Stage 1: Draft the question context and statement only (no options or keys)
+async function generateScenarioDraft(params: {
+  subject: string;
+  domain: string;
+  skill: string;
+  difficulty: string;
+  difficultyDefinition?: string;
+  studentLevel?: string;
+  feedback?: string;
+  examType: string;
+}, exemplarContext: string): Promise<ScenarioDraft> {
+  const systemPrompt = `You are an expert ${params.examType} ${params.subject === 'Math' ? 'Math' : 'English/Reading'} question scenario writer.
+Respond with ONLY a single valid JSON object containing passage, stimulus, and question_text. 
+Do NOT generate answer choices, correct answers, keys, or solutions. Keep the scenario draft clean.`;
+
+  const feedbackSection = params.feedback
+    ? `\nCRITICAL FEEDBACK from previous attempt: "${params.feedback}". You MUST resolve this and avoid repeating this exact issue.\n`
+    : '';
+
+  const difficultyLine = params.difficultyDefinition
+    ? `- Difficulty: ${params.difficulty} — ${params.difficultyDefinition}`
+    : `- Difficulty: ${params.difficulty}`;
+
+  const graphSection = (params.subject === 'Math' && isGraphRelevantSkill(params.domain, params.skill))
+    ? `\nThis domain/skill supports graph/coordinate-geometry items. Describe any graph, lines, points, or coordinate curves in text detail inside "stimulus" without referencing a picture.\n`
+    : '';
+
+  const userPrompt = `Generate a new original ${params.examType} ${params.subject} question draft.
+${feedbackSection}
+Specifications:
+- Domain: ${params.domain}
+- Skill: ${params.skill}
+${difficultyLine}
+${params.studentLevel ? `- Student Level: ${params.studentLevel}` : ''}
+${graphSection}${exemplarContext ? `\nStyle reference (do not copy, just match style):\n${exemplarContext}` : ''}
+
+Respond with exactly this JSON format:
+{
+  "passage": "A reading passage if English/Reading, or null if stand-alone question",
+  "stimulus": "Shared mathematical parameter, function definition, data table, coordinate description, or null if self-contained",
+  "question_text": "The actual question being asked. Reference the stimulus if present."
+}`;
+
+  return await callClaudeJSON<ScenarioDraft>(systemPrompt, userPrompt, 0.6);
+}
+
+// Stage 2: Solve the scenario step-by-step
+async function solveScenario(draft: ScenarioDraft, params: { subject: string; examType: string }): Promise<SolvedScenario> {
+  const systemPrompt = `You are a strict, chief exam mathematical and textual solver.
+Your task is to independently solve the question step-by-step and calculate the exact mathematical or textual answer.
+You must respond with a single JSON object containing: step_by_step_solution, exact_computed_answer, and explanation.`;
+
+  const userPrompt = `Solve the following exam question:
+${draft.passage ? `Passage: ${draft.passage}\n` : ''}${draft.stimulus ? `Stimulus: ${draft.stimulus}\n` : ''}Question: ${draft.question_text}
+
+Calculate the exact final numerical, fractional, or text-completion answer. Double check your arithmetic.
+For math: if the result is a fraction, write it in simplified form (e.g. '10/3') or decimal (e.g. '1.5').
+
+Respond with exactly this JSON format:
+{
+  "step_by_step_solution": "Show each step of your math or text logic clearly. Double-check all intermediate steps and calculations.",
+  "exact_computed_answer": "The exact final solved value (e.g. '138.33', '10/3', '0.8', 'taciturn'). This MUST be short, precise, and directly answer the question_text.",
+  "explanation": "A student-friendly rationale summarizing the correct reasoning."
+}`;
+
+  return await callClaudeJSON<SolvedScenario>(systemPrompt, userPrompt, 0.1);
+}
+
+// Stage 3: Generate distractors based on common student errors
+async function generateWrongChoices(
+  draft: ScenarioDraft,
+  solved: SolvedScenario,
+  params: { subject: string; examType: string }
+): Promise<WrongChoices> {
+  const systemPrompt = `You are an expert exam distractor options creator.
+Your goal is to generate exactly 3 plausible wrong options that reflect common student errors, misconceptions, and calculation slips.
+You must respond with a single JSON object containing: distractors.`;
+
+  const mathGuidelines = `Strict Distractor Guidelines (Math):
+1. Intermediate Step Trap (Half-Right): The value of an intermediate variable solved along the way (e.g., solving for x instead of the requested expression, or reporting x-intercept instead of y-intercept).
+2. Conceptual Misconception: Applying an incorrect rule (e.g., setting the sum of angles to 360 instead of 180, multiplying instead of dividing, or using opposite operations).
+3. Arithmetic / Sign Trap: The result of a minor calculation slip or sign flip (+/-).`;
+
+  const englishGuidelines = `Strict Distractor Guidelines (English/Reading):
+1. Plausible but unsupported by passage: Options using words from the passage but stating something unverified.
+2. Too broad or too narrow.
+3. Opposite or incorrect transition word.`;
+
+  const userPrompt = `Based on the following question and correct solution:
+${draft.passage ? `Passage: ${draft.passage}\n` : ''}${draft.stimulus ? `Stimulus: ${draft.stimulus}\n` : ''}Question: ${draft.question_text}
+Correct Answer: ${solved.exact_computed_answer}
+Step-by-Step Solution: ${solved.step_by_step_solution}
+
+Generate exactly 3 wrong choices. Do NOT include the correct answer (${solved.exact_computed_answer}) in this list.
+${params.subject === 'Math' ? mathGuidelines : englishGuidelines}
+
+Respond with exactly this JSON format:
+{
+  "distractors": [
+    {"choice_text": "Wrong value 1", "rationale": "Why students pick this (misconception)"},
+    {"choice_text": "Wrong value 2", "rationale": "Why students pick this (calculation error)"},
+    {"choice_text": "Wrong value 3", "rationale": "Why students pick this (intermediate trap)"}
+  ]
+}`;
+
+  return await callClaudeJSON<WrongChoices>(systemPrompt, userPrompt, 0.5);
+}
+
+// Stage 4: Programmatic Choice Assembler (Deterministic)
+function assembleChoices(
+  draft: ScenarioDraft,
+  solved: SolvedScenario,
+  wrong: WrongChoices,
+  params: { subject: string; domain: string; skill: string; difficulty: string; examType: string },
   uniqueSuffix: string
 ): Question {
-  const questionId = parsed.question_id
-    ? `gen_${uniqueSuffix}_${parsed.question_id}`
-    : `gen_${uniqueSuffix}`;
+  const computedAnswer = solved.exact_computed_answer.trim();
+  const rawDistractors = wrong.distractors.map(d => d.choice_text.trim());
 
-  const answerChoices: AnswerChoice[] = (parsed.answer_choices || []).map((c: any) => ({
-    id: c.choice_id || c.id || 'A',
-    text: c.choice_text || c.text || '',
+  // Deduplicate and filter out correct answer from distractors in case LLM slipped
+  const uniqueDistractors = Array.from(new Set(rawDistractors))
+    .filter(d => d !== computedAnswer)
+    .slice(0, 3);
+
+  // If we don't have enough distractors, fill in plausible placeholders
+  while (uniqueDistractors.length < 3) {
+    const backupVal = parseFloat(computedAnswer);
+    if (!isNaN(backupVal)) {
+      const offset = (uniqueDistractors.length + 1) * (backupVal > 10 ? 5 : 1);
+      uniqueDistractors.push(String(backupVal + offset));
+    } else {
+      uniqueDistractors.push(`Option ${uniqueDistractors.length + 2}`);
+    }
+  }
+
+  // Shuffle correct answer and distractors deterministically/randomly
+  const allChoices = [computedAnswer, ...uniqueDistractors];
+  
+  // Custom shuffle function (Fisher-Yates)
+  for (let i = allChoices.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [allChoices[i], allChoices[j]] = [allChoices[j], allChoices[i]];
+  }
+
+  const ids = ['A', 'B', 'C', 'D'];
+  const answerChoices: AnswerChoice[] = allChoices.map((text, idx) => ({
+    id: ids[idx],
+    text,
   }));
+
+  const correctLetter = ids[allChoices.indexOf(computedAnswer)] || 'A';
+
+  const correctRationale = `Derivation:\n${solved.step_by_step_solution}\n\nExplanation:\n${solved.explanation}`;
+
+  const distractorRationale: Record<string, string> = {};
+  wrong.distractors.forEach((d) => {
+    const matchedChoice = answerChoices.find(c => c.text === d.choice_text);
+    if (matchedChoice) {
+      distractorRationale[matchedChoice.id] = d.rationale;
+    }
+  });
+
+  const questionId = `gen_${uniqueSuffix}`;
+
+  const examSpecific: Record<string, any> = {
+    exact_computed_answer: computedAnswer,
+    step_by_step_solution: solved.step_by_step_solution,
+  };
 
   return {
     question_id: questionId,
     exam_type: params.examType,
-    // Use the exact section name the caller passed in (as defined in that
-    // exam's config file) rather than assuming SAT's "Math"/"Reading and
-    // Writing" naming — keeps this generic across exam configs.
     section: params.subject,
-    domain: parsed.domain || params.domain,
-    skill_tag: parsed.skill || params.skill,
-    difficulty: parsed.difficulty || params.difficulty,
-    passage: parsed.passage ?? null,
-    stimulus: parsed.stimulus ?? null,
-    question_text: parsed.question_text || '',
+    domain: params.domain,
+    skill_tag: params.skill,
+    difficulty: params.difficulty,
+    passage: draft.passage,
+    stimulus: draft.stimulus,
+    question_text: draft.question_text,
     answer_choices: answerChoices,
-    correct_answer: parsed.correct_answer || 'A',
+    correct_answer: correctLetter,
     explanation: {
-      correct_rationale: parsed.explanation || '',
-      distractor_rationale: {},
+      correct_rationale: correctRationale,
+      distractor_rationale: distractorRationale,
     },
     similarity_score: 0,
     similar_question_id: null,
@@ -458,66 +506,14 @@ function buildQuestionFromParsed(
       created_at: new Date().toISOString(),
       model_version: GENERATOR_MODEL,
       config_version: `${params.examType.toLowerCase()}.json-v1`,
-      exam_specific: {},
+      exam_specific: examSpecific,
     },
-    // NOTE: status is set to a provisional 'approved' here, but the
-    // orchestration pipeline (runOrchestrationPipeline) always overwrites
-    // this after independent validation — it only persists as 'approved'
-    // if the validator actually passes the question.
     status: 'approved',
   };
 }
 
-function parseGeneratorBatchResponse(response: any, params: {
-  subject: string;
-  domain: string;
-  skill: string;
-  difficulty: string;
-  examType: string;
-}): Question[] {
-  try {
-    let rawText: string = Array.isArray(response?.content)
-      ? response.content
-        .filter((b: any) => b.type === 'text')
-        .map((b: any) => b.text)
-        .join('')
-      : '';
-
-    if (!rawText) {
-      console.error('[Generator] No text in response');
-      return [];
-    }
-
-    const jsonText = extractJSON(rawText);
-    let parsedArray: any[];
-
-    try {
-      const parsed = JSON.parse(jsonText);
-      parsedArray = Array.isArray(parsed) ? parsed : [parsed];
-    } catch (parseErr) {
-      console.error('[Generator] JSON parse failed after cleanup. Cleaned text (first 500 chars):');
-      console.error(jsonText.slice(0, 500));
-      throw parseErr;
-    }
-
-    const timestamp = Date.now();
-
-    return parsedArray
-      .filter(item => item && typeof item === 'object')
-      .map((item, idx) => {
-        const uniqueSuffix = `${timestamp}_${idx}_${Math.random().toString(36).slice(2, 7)}`;
-        return buildQuestionFromParsed(item, params, uniqueSuffix);
-      });
-
-  } catch (error) {
-    console.error('[Generator] Error parsing batch response:', error);
-    return [];
-  }
-}
-
 // ═══════════════════════════════════════════════════════════
-// Generate a single chunk (internal — one Claude call, up to
-// `chunkSize` questions)
+// Generate a single chunk sequentially via decoupled pipeline
 // ═══════════════════════════════════════════════════════════
 async function generateChunk(params: {
   subject: string;
@@ -529,81 +525,31 @@ async function generateChunk(params: {
   feedback?: string;
   examType: string;
 }, exemplarContext: string, chunkSize: number, trace?: any): Promise<Question[]> {
-  const systemPrompt = buildSystemPromptForGenerator(params.subject, params.examType);
-  // Static block (specs + exemplars + schema) is identical across every
-  // chunk of this batch — this is what gets the cache_control breakpoint.
-  // Dynamic trailer (just the "generate exactly N" instruction) stays
-  // outside the cache so it never busts it.
-  const staticPrompt = buildStaticUserPromptForGenerator(params, exemplarContext);
-  const dynamicPrompt = buildDynamicCountTrailer(chunkSize);
+  const timestamp = Date.now();
 
-  // Rough token budget: ~250-350 tokens per question (question + 4 choices + explanation)
-  const maxOutputTokens = Math.min(8192, Math.max(2048, chunkSize * 350));
-  const generation = trace
-    ? trace.generation({
-      name: `generate-chunk-size-${chunkSize}`,
-      model: GENERATOR_MODEL,
-      modelParameters: {
-        temperature: 0.5,
-        max_tokens: maxOutputTokens,
-      },
-      input: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `${staticPrompt}\n\n${dynamicPrompt}` },
-      ],
-    })
-    : null;
-  try {
-    const response = await generateContentWithRetry({
-      staticPrompt,
-      dynamicPrompt,
-      systemPrompt,
-      temperature: 0.5, // slightly higher than single-question mode to encourage variety across the batch
-      maxOutputTokens,
-    });
+  // 1. Parallel Stage 1: Drafting
+  const draftPromises = Array.from({ length: chunkSize }, () =>
+    generateScenarioDraft(params, exemplarContext)
+  );
+  const drafts = await Promise.all(draftPromises);
 
-    // Quick sanity-check log: cache_read_input_tokens > 0 means this call
-    // hit the cache written by a previous chunk/call (90% cheaper on that
-    // many tokens). cache_creation_input_tokens > 0 means this call just
-    // wrote a fresh cache entry (costs +25% on those tokens, one time).
-    console.log(
-      `[Generator] tokens — input:${response.usage?.input_tokens ?? 0} ` +
-      `output:${response.usage?.output_tokens ?? 0} ` +
-      `cache_write:${response.usage?.cache_creation_input_tokens ?? 0} ` +
-      `cache_read:${response.usage?.cache_read_input_tokens ?? 0}`
-    );
+  // 2. Parallel Stage 2: Solving
+  const solvePromises = drafts.map(draft =>
+    solveScenario(draft, params)
+  );
+  const solvedList = await Promise.all(solvePromises);
 
-    // Update Langfuse on success. `usageDetails` (rather than the deprecated
-    // `usage` shape) is what lets Langfuse's cost engine price the
-    // cache-write and cache-read token buckets separately from normal
-    // input/output tokens — without this split you'd see a token count but
-    // an inflated/incorrect cost, since cached tokens are billed at
-    // different rates than fresh ones.
-    if (generation) {
-      const u = response.usage;
-      generation.end({
-        output: response.content,
-        usageDetails: {
-          input: u?.input_tokens ?? 0,
-          output: u?.output_tokens ?? 0,
-          cache_creation_input_tokens: u?.cache_creation_input_tokens ?? 0,
-          cache_read_input_tokens: u?.cache_read_input_tokens ?? 0,
-        },
-      });
-    }
+  // 3. Parallel Stage 3: Distractors
+  const wrongPromises = drafts.map((draft, idx) =>
+    generateWrongChoices(draft, solvedList[idx], params)
+  );
+  const wrongList = await Promise.all(wrongPromises);
 
-    return parseGeneratorBatchResponse(response, params);
-  }
-  catch (err: any) {
-    // Log failure to Langfuse
-    if (generation) {
-      generation.end({
-        statusMessage: err.message || String(err),
-        level: 'ERROR',
-      });
-    }
-    throw err;
-  }
+  // 4. Stage 4: Assembler (Synchronous)
+  return drafts.map((draft, idx) => {
+    const uniqueSuffix = `${timestamp}_${idx}_${Math.random().toString(36).slice(2, 7)}`;
+    return assembleChoices(draft, solvedList[idx], wrongList[idx], params, uniqueSuffix);
+  });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -631,6 +577,7 @@ export async function runGeneratorAgent(params: {
     chunkSize = 1,
     studentLevel,
   } = params;
+
   // Initialize Langfuse Trace
   const trace = getLangfuse().trace({
     name: 'claude-question-generation',
@@ -646,6 +593,7 @@ export async function runGeneratorAgent(params: {
       chunkSize,
     },
   });
+
   onStep?.({
     timestamp: new Date().toISOString(),
     type: 'draft',
@@ -694,8 +642,7 @@ export async function runGeneratorAgent(params: {
     message: `Generator Agent: Split into ${chunkSizes.length} chunk(s) of up to ${chunkSize} questions each.`,
   });
 
-  // STEP 3: Generate each chunk sequentially (keeps quota/rate-limit
-  // handling simple and predictable; bump concurrency later if needed)
+  // STEP 3: Generate each chunk sequentially
   const allQuestions: Question[] = [];
   const errors: string[] = [];
 
@@ -735,7 +682,6 @@ export async function runGeneratorAgent(params: {
         type: 'draft',
         message: `Generator Agent: Chunk ${i + 1}/${chunkSizes.length} failed — ${msg}`,
       });
-      // continue to next chunk rather than aborting the whole batch
     }
   }
 
