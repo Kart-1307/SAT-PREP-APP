@@ -102,9 +102,14 @@
   ],
   "style_rules": [
     "Do not duplicate real official College Board questions or passages.",
-    "For Reading & Writing: Passages should be dense, academic, and between 50-150 words.",
-    "For Math: Stimulus can be word problems, linear/nonlinear system parameters, geometric descriptions, or function formulas.",
-    "Distractors must be highly plausible, capturing typical errors (e.g., sign errors, misinterpreting variables, using opposite transitions, or choosing partially correct answers)."
+    "For Reading & Writing: Passages must be dense, scholarly, elevated high-school/undergraduate academic standard, between 50-150 words.",
+    "Passage Introductions: Every Reading & Writing passage MUST begin with a 1-line context introduction (e.g. 'The following excerpt is adapted from...', 'The following passage is from a 2022 study by...').",
+    "Table Context: Any table-based stimulus must begin with a descriptive introductory sentence (e.g. 'The table below presents data on...').",
+    "Sentence Introductions: Avoid repetitive stems like 'Scientists say' or 'Researchers say'. Use diverse academic openings (e.g. 'A team of evolutionary biologists...', 'In a seminal 2021 study...', 'Literary scholars analyzing...').",
+    "Formal Analytical Language: Never use subjective phrasing like 'The author says'. Use objective academic verbs: 'The author argues...', 'The passage suggests...', 'The text indicates...', 'The researchers contend...'.",
+    "Natural Blank Positioning: Spread fill-in-the-blank positions naturally throughout the passage rather than restricting them to the final sentence.",
+    "Name Diversity: Use character and researcher names from diverse global ethnic backgrounds. Avoid repeating names across questions.",
+    "Distractor Calibration: Easy (1 clear wrong, 2 plausible distant traps), Medium (high-plausibility traps based on partial text or scope shift), Hard (subtle verbatim-keyword traps asserting unstated or inverted claims)."
   ],
   "validation_rubric": {
     "min_composite_score": 90,
@@ -120,12 +125,12 @@
       },
       {
         "id": "distractor_quality",
-        "description": "Are distractors realistic, non-obvious, and derived from common student mistakes? Is there absolutely NO secondary defensible correct answer?",
+        "description": "Are distractors realistic, non-obvious, difficulty-calibrated, and free of secondary defensible answers?",
         "weight": 20
       },
       {
         "id": "clarity",
-        "description": "Is the text grammatical, free of typos, and completely unambiguous?",
+        "description": "Is the text grammatical, formal, free of informal/subjective phrasing ('says', 'thinks'), and completely unambiguous?",
         "weight": 15
       },
       {
@@ -145,7 +150,7 @@
       },
       {
         "id": "bias_sensitivity",
-        "description": "Is the question free of cultural, regional, socio-economic biases, and sensitive topics?",
+        "description": "Is the question free of cultural, regional, socio-economic biases, and uses diverse multicultural representation?",
         "weight": 5
       }
     ]

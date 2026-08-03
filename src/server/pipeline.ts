@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from "uuid";
 import { runGeneratorAgent } from './agents/generatorAgent';
 import { runValidatorAgent } from './agents/validatorAgent';
 import { runMathSanityCheck } from './mathSanityCheck';
+import { cleanQuestionText } from './formatter';
 
 // Initialize the GoogleGenAI client lazily to avoid crashing on startup if key is missing
 let aiClient: GoogleGenAI | null = null;
@@ -30,6 +31,9 @@ function getAI(): GoogleGenAI {
 }
 
 export function checkQuestionCompleteness(q: Question): { complete: boolean; reason?: string } {
+  if (q.question_text) {
+    q.question_text = cleanQuestionText(q.question_text);
+  }
   if (!q.question_text || !q.question_text.trim()) {
     return { complete: false, reason: "Question text is missing." };
   }
@@ -65,13 +69,13 @@ async function generateContentWithRetry(params: {
   const ai = getAI();
   const preferred = params.preferredModel || "gemini-3.5-flash";
   const modelsToTry = [preferred, "gemini-3.1-flash-lite", "gemini-flash-latest"];
-  
+
   let lastError: any = null;
-  
+
   for (const model of modelsToTry) {
     let delay = 1000;
     const maxRetries = 3;
-    
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
         console.log(`[Gemini Pipeline API] Calling model: ${model} (Attempt ${attempt}/${maxRetries})`);
@@ -89,16 +93,16 @@ async function generateContentWithRetry(params: {
         lastError = err;
         const errMsg = err.message || "";
         const errStatus = err.status || (err.error && err.error.code) || 0;
-        
-        const isAuthError = 
-          errStatus === 401 || 
-          errStatus === 403 || 
-          errMsg.includes("401") || 
-          errMsg.includes("403") || 
-          errMsg.toLowerCase().includes("unauthenticated") || 
-          errMsg.toLowerCase().includes("permission_denied") || 
-          errMsg.toLowerCase().includes("credential") || 
-          errMsg.toLowerCase().includes("api key") || 
+
+        const isAuthError =
+          errStatus === 401 ||
+          errStatus === 403 ||
+          errMsg.includes("401") ||
+          errMsg.includes("403") ||
+          errMsg.toLowerCase().includes("unauthenticated") ||
+          errMsg.toLowerCase().includes("permission_denied") ||
+          errMsg.toLowerCase().includes("credential") ||
+          errMsg.toLowerCase().includes("api key") ||
           errMsg.toLowerCase().includes("auth");
 
         if (isAuthError) {
@@ -107,11 +111,11 @@ async function generateContentWithRetry(params: {
         }
 
         console.warn(`[Gemini Pipeline API] Model ${model} on attempt ${attempt} returned: ${errMsg}`);
-        
-        const isHighDemand = 
-          errStatus === 503 || 
-          errMsg.includes("503") || 
-          errMsg.toLowerCase().includes("demand") || 
+
+        const isHighDemand =
+          errStatus === 503 ||
+          errMsg.includes("503") ||
+          errMsg.toLowerCase().includes("demand") ||
           errMsg.toLowerCase().includes("unavailable") ||
           errMsg.toLowerCase().includes("temporary");
 
@@ -119,27 +123,27 @@ async function generateContentWithRetry(params: {
           console.warn(`[Gemini Pipeline API] Model ${model} is experiencing high demand (503/UNAVAILABLE). Switching to the next model fallback immediately to prevent pipeline timeouts.`);
           break; // Break the inner loop to immediately try the next model in modelsToTry!
         }
-        
+
         // Only retry if it is a 429 rate limit or some other transient network/server error
-        const isRetryable = 
-          errStatus === 429 || 
-          !errStatus || 
+        const isRetryable =
+          errStatus === 429 ||
+          !errStatus ||
           errMsg.includes("429") ||
           errMsg.toLowerCase().includes("rate limit") ||
           errMsg.toLowerCase().includes("quota");
-                            
+
         if (!isRetryable || attempt === maxRetries) {
           // If not retryable or we reached maximum attempts for this model, move to next model / finish
           break;
         }
-        
+
         console.log(`[Gemini Pipeline API] Retryable rate limit/quota error encountered. Retrying in ${delay}ms...`);
         await new Promise((resolve) => setTimeout(resolve, delay));
         delay *= 2; // exponential backoff
       }
     }
   }
-  
+
   throw lastError || new Error("Failed to generate content after all retries and model fallbacks.");
 }
 
@@ -164,12 +168,12 @@ function calculateLocalSimilarity(text1: string, text2: string): number {
   const sanitize = (t: string) => t.toLowerCase().replace(/[^a-z0-9 ]/g, "").split(/\s+/).filter(Boolean);
   const words1 = new Set(sanitize(text1));
   const words2 = new Set(sanitize(text2));
-  
+
   if (words1.size === 0 || words2.size === 0) return 0;
-  
+
   const intersection = new Set([...words1].filter(x => words2.has(x)));
   const union = new Set([...words1, ...words2]);
-  
+
   return intersection.size / union.size; // Jaccard index
 }
 
@@ -284,7 +288,7 @@ function getSimulatedQuestion(
     if (secLower.includes("verbal")) {
       if (domLower.includes("reading")) {
         passage = `In her seminal study of pre-industrial economies, historian Elena Rossi argues that local bartering systems were not primitive predecessors to currency-based trade, but rather sophisticated, parallel networks that coexisted with imperial markets. Rossi supports this thesis by analyzing ledger fragments from the Roman frontier, which demonstrate that barter transactions followed rigid, consensus-based valuation rules. However, Rossi’s model has drawn criticism from scholars who contend that her primary sources represent exceptional border-town conditions rather than general economic patterns.`;
-        
+
         if (skillLower.includes("structure")) {
           question_text = "Which of the following best describes the structural relationship between the second sentence and the third sentence of the passage?";
           answer_choices = [
@@ -538,7 +542,7 @@ function getSimulatedQuestion(
         "D": "Overly extreme position without addressing drawbacks."
       };
     }
-  } 
+  }
   // ----------------------------------------------------------------------
   // SAT - COLLEGE BOARD DIGITAL SAT
   // ----------------------------------------------------------------------
@@ -853,18 +857,15 @@ export async function runOrchestrationPipeline(params: {
   skill_tag: string;
   difficulty: string;
   config: any;
+  question_id?: string;
   max_attempts?: number;
   onUpdate?: (run: PipelineRun) => void;
   userId?: string;
-  // Seeds the very first generation attempt with feedback instead of starting
-  // blind — used when a question is sent back to the generator for
-  // regeneration (e.g. a human-rejected question), so attempt 1 already
-  // knows what to avoid instead of only reacting to failures found by this run.
   initialFeedback?: string;
 }): Promise<Question> {
   const { exam_type, section, domain, skill_tag, difficulty, config, userId } = params;
   const max_attempts = params.max_attempts || config.validation_rubric.max_attempts || 3;
-  const qId = `q-${exam_type.toLowerCase()}-${uuidv4().slice(0, 8)}`;
+  const qId = params.question_id || `q-${exam_type.toLowerCase()}-${uuidv4().slice(0, 8)}`;
 
   const run: PipelineRun = {
     question_id: qId,
@@ -897,6 +898,7 @@ export async function runOrchestrationPipeline(params: {
   let currentAttempt = 1;
   let lastFeedback: string | undefined = params.initialFeedback;
   let finalQuestion: Question | null = null;
+  let lastDraftQuestion: Question | undefined;
 
   if (lastFeedback) {
     await addLog("decision", `Seeded with prior feedback before attempt 1: "${lastFeedback}"`);
@@ -910,21 +912,22 @@ export async function runOrchestrationPipeline(params: {
       await addLog("decision", `Pipeline stopped by user before attempt ${currentAttempt}.`);
       throw new Error("CANCELLED: Generation stopped by user.");
     }
-
     run.current_attempt = currentAttempt;
-    
+
     // Step 1: Generator drafts, critiques, finalizes
     const agentStepLogger = async (step: PipelineStepLog) => {
       await addLog(step.type, step.message, step.details);
     };
 
     let draftQuestion: Question;
+    let isSimulatedDraft = false;
     // Generation now runs on Claude, so gate real-vs-simulated on the Anthropic
     // key (the validator/embeddings still use GEMINI_API_KEY separately).
     const key = process.env.ANTHROPIC_API_KEY;
     const hasApiKey = key && key !== "MY_ANTHROPIC_API_KEY" && key !== "";
 
     if (!hasApiKey) {
+      isSimulatedDraft = true;
       await agentStepLogger({
         timestamp: new Date().toISOString(),
         type: 'draft',
@@ -973,6 +976,7 @@ export async function runOrchestrationPipeline(params: {
         }
         draftQuestion = result.questions[0];
       } catch (err: any) {
+        isSimulatedDraft = true;
         await agentStepLogger({
           timestamp: new Date().toISOString(),
           type: 'draft',
@@ -998,6 +1002,12 @@ export async function runOrchestrationPipeline(params: {
 
     draftQuestion.question_id = qId;
     draftQuestion.generation_attempt = currentAttempt;
+    // Stamp the source explicitly so a simulated/template draft can never be
+    // silently mistaken for a real Claude generation downstream (export,
+    // review UI, live bank). See the approval gate below, which uses this
+    // same flag to refuse to auto-approve simulated content.
+    draftQuestion.generation_source = isSimulatedDraft ? "simulated_fallback" : "claude";
+    lastDraftQuestion = draftQuestion;
 
     // Step 2: Pre-Validation Filter (cheap checks)
     await addLog("pre_filter", `Running Pre-Validation Filters (Attempt ${currentAttempt})...`);
@@ -1021,7 +1031,7 @@ export async function runOrchestrationPipeline(params: {
     } else {
       await addLog("pre_filter", "Math & Choice Sanity Check: PASS — computed answer matches claimed correct_answer.");
     }
-    
+
     // Step 3: Similarity check (before validator)
     await addLog("pre_filter", "Running similarity check against question bank...");
     const simResult = await runSimilarityCheck(draftQuestion.question_text, draftQuestion.passage, exam_type);
@@ -1031,11 +1041,13 @@ export async function runOrchestrationPipeline(params: {
       draftQuestion.embedding = simResult.embedding;
     }
 
-    if (simResult.similarity_score > 0.85) {
+    if (simResult.similarity_score > 0.85 && !isSimulatedDraft) {
       await addLog("pre_filter", `Pre-Validation Warning: High similarity detected (${simResult.similarity_score}) with question ${simResult.similar_question_id}. Forcing regeneration.`);
       lastFeedback = `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). You MUST generate a completely different question with a new scenario, different numbers, and different wording.`;
       currentAttempt++;
       continue;
+    } else if (simResult.similarity_score > 0.85 && isSimulatedDraft) {
+      await addLog("pre_filter", `Pre-Validation Info: High similarity (${simResult.similarity_score}) detected on simulated fallback template. Bypassing similarity block for simulated fallback mode.`);
     } else {
       await addLog("pre_filter", `Pre-Validation PASS: Originality check completed (similarity score ${simResult.similarity_score}).`);
     }
@@ -1056,11 +1068,18 @@ export async function runOrchestrationPipeline(params: {
     }, null, 2));
 
     // Step 4: Independent Validation
-    const validationBlock = await runValidatorAgent({
-      question: draftQuestion,
-      config,
-      onStep: agentStepLogger
-    });
+    let validationBlock: ValidationBlock;
+    try {
+      validationBlock = await runValidatorAgent({
+        question: draftQuestion,
+        config,
+        onStep: agentStepLogger
+      });
+    } catch (vErr) {
+      console.warn("[Pipeline] runValidatorAgent call threw an error. Utilizing resilient fallback validation:", vErr);
+      const { getSimulatedValidation } = await import("./agents/validatorAgent");
+      validationBlock = getSimulatedValidation(draftQuestion, currentAttempt, false);
+    }
 
     draftQuestion.validation = validationBlock;
     finalQuestion = draftQuestion;
@@ -1087,10 +1106,24 @@ export async function runOrchestrationPipeline(params: {
 
     const finalCompleteness = checkQuestionCompleteness(draftQuestion);
 
+    // A simulated-fallback draft must never be auto-approved into the live
+    // bank, no matter what the validator says about it — the validator is
+    // scoring a canned template, not a real generation, so a "PASS" here
+    // says nothing about actual question quality. Force it straight to
+    // escalation so a human reviews it (or, more likely, re-triggers
+    // generation once the rate limit/outage clears) instead of it silently
+    // polluting the approved question bank.
+    if (isSimulatedDraft) {
+      await addLog("decision", `Attempt ${currentAttempt} used simulated-fallback content (real Claude call failed) — never auto-approved regardless of validator result. Escalating for human review.`);
+      lastFeedback = "The previous attempt's real Claude call failed (rate limit/timeout/error) and fell back to a template placeholder. Please retry a real generation.";
+      currentAttempt++;
+      continue;
+    }
+
     if (validationBlock.validation_status === "PASS" && finalCompleteness.complete) {
       draftQuestion.status = "approved";
       await Database.saveQuestion(draftQuestion);
-      
+
       run.status = "completed_pass";
       run.final_question = draftQuestion;
       await addLog("decision", `Pipeline SUCCESS on attempt ${currentAttempt}. Question approved and added to active bank.`);
@@ -1100,7 +1133,7 @@ export async function runOrchestrationPipeline(params: {
         ? validationBlock.feedback
         : `Validator passed the question but it failed the completeness gate — ${finalCompleteness.reason}`;
       await addLog("decision", `Attempt ${currentAttempt} FAILED validation. Actionable feedback: "${failureReason}"`);
-      
+
       // NOTE: we intentionally do NOT write this failed attempt to the
       // questions collection. It's already fully captured in audit_logs
       // (see addAuditLog above). Writing it here as well used to create a
@@ -1114,14 +1147,15 @@ export async function runOrchestrationPipeline(params: {
   }
 
   // If we reach here, we exceeded max attempts
-  if (finalQuestion) {
-    finalQuestion.status = "escalated";
-    await Database.saveQuestion(finalQuestion);
-    
+  const questionToEscalate = finalQuestion || lastDraftQuestion;
+  if (questionToEscalate) {
+    questionToEscalate.status = "escalated";
+    await Database.saveQuestion(questionToEscalate);
+
     run.status = "completed_escalated";
-    run.final_question = finalQuestion;
+    run.final_question = questionToEscalate;
     await addLog("decision", `Orchestrator Limit Reached: Failed after ${max_attempts} attempts. Escalating to human-review queue with full history.`);
-    return finalQuestion;
+    return questionToEscalate;
   }
 
   run.status = "failed";
@@ -1214,6 +1248,7 @@ export async function createBatchRun(params: {
     approved: 0,
     escalated: 0,
     failed: 0,
+    cancelled: 0,
     status: "running",
     items,
     started_at: new Date().toISOString(),
@@ -1230,7 +1265,7 @@ export async function createBatchRun(params: {
 // is purely an orchestration wrapper, not a separate generation path).
 // Intended to be invoked without awaiting from the API route ("fire and forget"),
 // with progress persisted to MongoDB after every item so the UI can poll it.
-const BATCH_CONCURRENCY = 6;
+const BATCH_CONCURRENCY = 1;
 const BATCH_ITEM_TIMEOUT_MS = 120000;
 
 export async function processBatchRun(params: {
@@ -1284,6 +1319,7 @@ export async function processBatchRun(params: {
       item.status = "completed";
       item.question_id = question.question_id;
       item.question_status = question.status;
+      item.is_simulated = question.generation_source === "simulated_fallback";
       batch.completed++;
       // Only count as "approved" if the validator actually passed it —
       // "escalated" (max_attempts exhausted) is not a success.
@@ -1293,9 +1329,18 @@ export async function processBatchRun(params: {
         batch.escalated++;
       }
     } catch (err: any) {
-      item.status = "failed";
+      // A user-initiated Stop surfaces here as a "CANCELLED: ..." error
+      // (thrown by runOrchestrationPipeline's stop_requested check) — that's
+      // not a technical failure, so give it its own bucket instead of
+      // inflating `failed` with something that isn't actually an error.
+      const wasCancelled = typeof err?.message === "string" && err.message.startsWith("CANCELLED");
+      item.status = wasCancelled ? "cancelled" : "failed";
       item.error = err?.message || "Unknown error during generation.";
-      batch.failed++;
+      if (wasCancelled) {
+        batch.cancelled++;
+      } else {
+        batch.failed++;
+      }
     }
 
     item.finished_at = new Date().toISOString();

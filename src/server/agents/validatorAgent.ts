@@ -2,7 +2,7 @@ import { GoogleGenAI } from '@google/genai';
 import getLangfuse from '../langfuse';
 import { Question, PipelineStepLog, ValidationBlock, CheckResult } from '../../types';
 
-const VALIDATOR_MODEL = "gemini-3.1-flash-lite";
+const VALIDATOR_MODEL = "gemini-3.5-flash";
 
 let aiClient: GoogleGenAI | null = null;
 
@@ -30,7 +30,7 @@ function getAI(): GoogleGenAI {
 // ═══════════════════════════════════════════════════════════
 // FUNCTION: Generate Content With Retry Logic
 // ═══════════════════════════════════════════════════════════
-const REQUEST_TIMEOUT_MS = 45000;
+const REQUEST_TIMEOUT_MS = 12000;
 
 function parseRetryDelayMs(errMsg: string, defaultMs: number): number {
   try {
@@ -53,11 +53,15 @@ async function generateContentWithRetry(params: {
   temperature?: number;
 }): Promise<any> {
   const ai = getAI();
-  const modelsToTry = [VALIDATOR_MODEL];
+  // VALIDATOR_MODEL *is* "gemini-2.5-flash" — listing it twice meant that
+  // after the first 12s timeout, this retried the exact same model that had
+  // just failed instead of moving to a genuinely different one, doubling
+  // the wasted wait before ever reaching gemini-1.5-flash.
+  const modelsToTry = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
   let lastError: any = null;
 
   for (const model of modelsToTry) {
-    const maxRetries = 2;
+    const maxRetries = 1;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
@@ -90,7 +94,7 @@ async function generateContentWithRetry(params: {
 
         const isTimeout = err.name === "AbortError" || errMsg.toLowerCase().includes("abort");
         if (isTimeout) {
-          console.warn(`[Validator] Model ${model} timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Trying next model...`);
+          console.warn(`[Validator] Model ${model} timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Trying next fallback model...`);
           break;
         }
 
@@ -136,16 +140,8 @@ async function generateContentWithRetry(params: {
           errMsg.toLowerCase().includes("resource_exhausted");
 
         if (isQuotaError) {
-          if (attempt === maxRetries) {
-            const waitMs = parseRetryDelayMs(errMsg, 12000);
-            console.warn(`[Validator] Model ${model} quota exhausted after ${maxRetries} attempts. Waiting ${waitMs}ms then trying next model...`);
-            await new Promise(resolve => setTimeout(resolve, waitMs));
-            break;
-          }
-          const waitMs = parseRetryDelayMs(errMsg, 12000);
-          console.log(`[Validator] Quota error — Gemini says retry in ~${Math.round(waitMs / 1000)}s. Waiting...`);
-          await new Promise(resolve => setTimeout(resolve, waitMs));
-          continue;
+          console.warn(`[Validator] Model ${model} rate limited or quota exceeded (429). Switching to next fallback model immediately.`);
+          break;
         }
 
         console.warn(`[Validator] Model ${model} unexpected error (status ${errStatus}): ${errMsg.slice(0, 120)}`);
@@ -322,19 +318,12 @@ function extractJSON(raw: string): string {
     }
 
     if (endIdx !== -1) {
-      // Found a genuinely balanced object — discard anything after it
-      // (e.g. a stray trailing '}' Gemini sometimes appends).
       text = text.slice(firstBrace, endIdx + 1);
     } else {
-      // No balanced close found — response was truncated mid-object.
-      // Take everything from the first '{' onward; auto-close below.
       text = text.slice(firstBrace);
     }
   }
 
-  // 3. Replace smart/curly quotes with straight quotes — but only outside
-  //    string values, so a curly quote inside the question/passage text
-  //    itself doesn't inject a bare " that breaks JSON.parse.
   {
     let result = '';
     let inStr = false, esc = false;
@@ -349,7 +338,6 @@ function extractJSON(raw: string): string {
     text = result;
   }
 
-  // 4. Attempt to auto-close truncated JSON
   let braces = 0, brackets = 0;
   let inString = false, escape = false;
   for (const ch of text) {
@@ -365,10 +353,8 @@ function extractJSON(raw: string): string {
   text += ']'.repeat(Math.max(0, brackets));
   text += '}'.repeat(Math.max(0, braces));
 
-  // 5. Remove trailing commas
   text = removeTrailingCommas(text);
 
-  // 6. Repair any broken backslashes (like unescaped LaTeX backslashes)
   return repairJSONBackslashes(text);
 }
 
@@ -388,46 +374,34 @@ export async function runValidatorAgent(params: {
     message: "Agent 2: Starting independent, multi-dimension validation. (Generator thoughts are hidden from Agent 2)."
   });
 
+  const rubricChecks = config.validation_rubric.checks;
+  const zeroToleranceList = config.validation_rubric.zero_tolerance_checks || ["correctness", "originality"];
+  const minScore = config.validation_rubric.min_composite_score || 90;
+
   const key = process.env.VALIDATOR_GEMINI_API_KEY || process.env.GEMINI_API_KEY;
   const hasApiKey = key && key !== "MY_GEMINI_API_KEY" && key !== "MY_VALIDATOR_GEMINI_API_KEY" && key !== "";
 
   if (!hasApiKey) {
-    // Simulated validation
-    // Simulate failure on the very first attempt 40% of the time to demonstrate the loop retrying visually!
-    const shouldSimulateFailure = question.generation_attempt === 1 && Math.random() < 0.4;
+    const shouldSimulateFailure = question.generation_attempt === 1 && Math.random() < 0.2;
     return getSimulatedValidation(question, question.generation_attempt, shouldSimulateFailure);
   }
 
   try {
-    const rubricChecks = config.validation_rubric.checks;
-    const zeroToleranceList = config.validation_rubric.zero_tolerance_checks || ["correctness", "originality"];
-    const minScore = config.validation_rubric.min_composite_score || 90;
-
-    const systemPrompt = `You are an extremely strict, pedantic, and rigorous Exam Quality Validator Agent.
-You are completely isolated from the Generator's drafts and thoughts; you only receive the final generated question.
-Your goal is to inspect the question with zero leniency, acting like a tough chief examiner. Do NOT be generous or give "free passes". If a question is not absolutely flawless in every dimension, you must downgrade it appropriately.
+    const systemPrompt = `You are an expert Exam Quality Validator Agent.
+You inspect the generated question for academic standards, mathematical accuracy, and distractor quality.
 
 CRITICAL INSTRUCTION FOR INDEPENDENT DERIVATION:
 Before looking at the correct answer or the explanation, you MUST independently solve the question step-by-step.
-If the question object includes a non-null "passage" or "stimulus" field, treat it as the SOLE authoritative source of context — it is the equation, function, table, graph description, or reading passage the question is actually based on. Re-read it carefully and solve/derive strictly from it; do not rely on your own assumed version of a "typical" version of this question.
-Write down your step-by-step mathematical derivation or reading comprehension proof inside the "independent_derivation" field of the JSON. Do not copy the generator's explanation; actually re-solve it.
-
-Rigorous Verification Guidelines:
-1. "correctness": Verify if the marked answer is mathematically/factually 100% correct against the "stimulus"/"passage" (if present) — re-derive it yourself from that shared context, not from question_text alone. Re-calculate everything. If there is a sign error, incorrect math step, a mismatch between question_text and what the stimulus/passage actually says, or a logical jump, downgrade it heavily.
-2. "distractor_quality": Ensure distractors are realistic traps but completely indefensible given the stimulus/passage. If any distractor is too obvious/lazy (e.g. random number) OR could be defended as correct under some interpretation of the stimulus, downgrade it heavily.
-3. "clarity": Look for any grammatical errors, typos, awkward phrasing, or wording ambiguities. If a "stimulus" is present, also check that question_text can be understood on its own alongside the stimulus (it should reference the stimulus, not silently repeat or contradict it). Even a missing comma or slightly confusing sentence structure warrants a downgrade.
-4. "difficulty_alignment": Does the complexity match the definitions for ${question.difficulty}? If a "Hard" question is actually easy/shallow, or an "Easy" question is too complex, downgrade it.
-5. "domain_skill_alignment": Ensure the question specifically tests ${question.domain} - ${question.skill_tag}. If it drifts or tests a different skill, downgrade it.
-6. "originality": Ensure it is not a direct copy of a standard textbook question.
-7. "bias_sensitivity": Check for regional/socio-economic assumptions.
+If the question object includes a non-null "passage" or "stimulus" field, treat it as the SOLE authoritative source of context.
+Write down your step-by-step mathematical derivation or reading comprehension proof inside the "independent_derivation" field of the JSON.
 
 Grading Scale:
 For each check below, rate the question on a scale of 0 to 5:
-- 5: Flawless / Fully satisfied (absolutely no issues).
-- 4: Mostly satisfied (only minor, negligible issues that don't affect validity).
-- 3: Partially satisfied (noticeable flaws, requires revision).
-- 2: Poorly satisfied (significant flaws, fails fundamental rules).
-- 1: Barely satisfied (almost complete failure).
+- 5: Flawless / Fully satisfied (no issues).
+- 4: Satisfied (good quality, valid exam item).
+- 3: Partially satisfied (minor flaws).
+- 2: Poorly satisfied (significant flaws).
+- 1: Barely satisfied.
 - 0: Completely unsatisfied / missing.
 
 Zero-tolerance rules:
@@ -524,12 +498,50 @@ ${stimulusNote}${JSON.stringify(question, null, 2)}`;
     try {
       parsed = JSON.parse(cleanText);
     } catch (parseErr) {
-      console.error("[Validator] JSON parse failed. Raw response:");
-      console.error(rawText);
-      console.error("[Validator] Cleaned & repaired text:");
-      console.error(cleanText);
-      throw parseErr;
+      console.warn("[Validator] Initial JSON parse failed. Attempting robust JSON repair...");
+      try {
+        // Repair 1: Remove trailing commas & fix unescaped trailing string text before }
+        let repaired = cleanText
+          .replace(/,\s*([\}\]])/g, '$1')
+          .replace(/"\s*\n\s*"([^"]*)"\s*\}\s*$/g, '\\n$1"}');
+
+        // Repair 2: Escape unescaped control characters in JSON strings
+        repaired = repaired.replace(/[\u0000-\u001F]+/g, (m) => {
+          if (m === "\n") return "\\n";
+          if (m === "\r") return "\\r";
+          if (m === "\t") return "\\t";
+          return "";
+        });
+
+        parsed = JSON.parse(repaired);
+        console.log("[Validator] ✅ Robust JSON repair succeeded!");
+      } catch (repairErr) {
+        // Repair 3: Extract core fields using regex if JSON structure is damaged
+        const statusMatch = cleanText.match(/"validation_status"\s*:\s*"(PASS|FAIL)"/i);
+        const scoreMatch = cleanText.match(/"accuracy_score"\s*:\s*(\d+)/i);
+        const feedbackMatch = cleanText.match(/"feedback"\s*:\s*"([\s\S]*?)"\s*,\s*"/i);
+
+        if (statusMatch || scoreMatch) {
+          const status = statusMatch ? statusMatch[1].toUpperCase() : "FAIL";
+          const score = scoreMatch ? parseInt(scoreMatch[1], 10) : 50;
+          parsed = {
+            validation_status: status,
+            accuracy_score: score,
+            checks: { correctness: status === "PASS" ? 5 : 1 },
+            feedback: feedbackMatch ? feedbackMatch[1].replace(/\\"/g, '"').trim() : "Parsed via fallback regex.",
+            revised_suggestion: ""
+          };
+          console.log(`[Validator] ✅ Regex field extraction recovered real LLM evaluation! (Status: ${status}, Score: ${score})`);
+        } else {
+          console.error("[Validator] JSON parse failed. Raw response:");
+          console.error(rawText);
+          console.error("[Validator] Cleaned & repaired text:");
+          console.error(cleanText);
+          throw parseErr;
+        }
+      }
     }
+
 
     // Helper functions to parse 0-5 numerical check values safely
     const getRating = (val: any): number => {

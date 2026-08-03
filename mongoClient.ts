@@ -9,10 +9,12 @@ async function ensureIndexes(db: Db): Promise<void> {
     await Promise.all([
       db.collection('questions').createIndex({ question_id: 1 }, { unique: true }),
       db.collection('questions').createIndex({ exam_type: 1, status: 1 }),
+      db.collection('questions').createIndex({ exam_type: 1, status: 1, 'metadata.created_at': -1 }),
       db.collection('audit_logs').createIndex({ id: 1 }, { unique: true }),
       db.collection('audit_logs').createIndex({ exam_type: 1, timestamp: -1 }),
       db.collection('pipeline_runs').createIndex({ question_id: 1 }, { unique: true }),
       db.collection('pipeline_runs').createIndex({ exam_type: 1, started_at: -1 }),
+      db.collection('pipeline_runs').createIndex({ section: 1, domain: 1, skill_tag: 1, difficulty: 1, started_at: -1 }),
       db.collection('batch_runs').createIndex({ batch_id: 1 }, { unique: true }),
       db.collection('batch_runs').createIndex({ exam_type: 1, status: 1 })
     ]);

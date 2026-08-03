@@ -59,6 +59,50 @@ async function generateContentWithRetry(params: {
 }): Promise<Anthropic.Message> {
   const ai = getAI();
 
+  // Rate limits are the one failure mode worth retrying in-process before
+  // giving up: they're transient and usually clear within a few seconds,
+  // unlike auth errors or malformed-schema errors which won't fix themselves.
+  // `maxRetries: 0` below intentionally disables the SDK's own retry (see the
+  // comment on that option) so this loop is the *only* retry path — bounded,
+  // logged, and specific to 429s only.
+  const MAX_RATE_LIMIT_RETRIES = 2;
+  const BASE_BACKOFF_MS = 2000;
+
+  for (let rateLimitAttempt = 0; rateLimitAttempt <= MAX_RATE_LIMIT_RETRIES; rateLimitAttempt++) {
+    try {
+      return await callOnce(ai, params);
+    } catch (err: any) {
+      const isRateLimit = err instanceof Anthropic.RateLimitError || err?.status === 429;
+      if (!isRateLimit || rateLimitAttempt === MAX_RATE_LIMIT_RETRIES) {
+        throw err;
+      }
+      // Respect the API's own Retry-After header when present, otherwise
+      // fall back to exponential backoff. Capped at 15s so a single call
+      // can't eat the whole 120s batch-item budget on its own.
+      const retryAfterHeader = err?.headers?.["retry-after"];
+      const retryAfterMs = retryAfterHeader ? Number(retryAfterHeader) * 1000 : NaN;
+      const backoffMs = Math.min(
+        !isNaN(retryAfterMs) ? retryAfterMs : BASE_BACKOFF_MS * Math.pow(2, rateLimitAttempt),
+        15000
+      );
+      console.warn(`[Generator] Rate limited (429). Retrying in ${Math.round(backoffMs / 1000)}s (attempt ${rateLimitAttempt + 1}/${MAX_RATE_LIMIT_RETRIES})...`);
+      await new Promise(resolve => setTimeout(resolve, backoffMs));
+    }
+  }
+  // Unreachable — the loop above always returns or throws — but keeps TS happy.
+  throw new Error("Unreachable: rate limit retry loop exited without returning or throwing.");
+}
+
+async function callOnce(
+  ai: Anthropic,
+  params: {
+    staticPrompt: string;
+    dynamicPrompt: string;
+    systemPrompt: string;
+    temperature?: number;
+    maxOutputTokens?: number;
+  }
+): Promise<Anthropic.Message> {
   try {
     console.log(`[Generator] Calling model: ${GENERATOR_MODEL}`);
 

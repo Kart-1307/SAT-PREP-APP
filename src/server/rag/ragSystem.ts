@@ -13,7 +13,8 @@ import {
 } from './jsonLoader';
 import fs from 'fs';
 import path from 'path';
-import { MongoClient, Db } from 'mongodb';
+import { Db } from 'mongodb';
+import { getDb } from '../mongoClient';
 
 export type { JSONQuestion };
 
@@ -69,16 +70,9 @@ function updateCacheStatus(updates: Partial<IndexingCache>) {
   fs.writeFileSync(CACHE_STATUS_FILE, JSON.stringify(sanitizeCache({ ...current, ...updates }), null, 2));
 }
 
-// Module-level singleton — one connection reused across all RAG operations.
-let _ragDb: Db | null = null;
+// Shared database connection pool for RAG tracking and usage history operations.
 async function getRagDb(): Promise<Db> {
-  if (_ragDb) return _ragDb;
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error('MONGODB_URI not set');
-  const client = new MongoClient(uri);
-  await client.connect();
-  _ragDb = client.db();
-  return _ragDb;
+  return await getDb();
 }
 
 // Call this on DB reset — clears exemplar rotation history from MongoDB.
@@ -278,7 +272,7 @@ export async function retrieveExemplarQuestionsForGeneration(params: {
 export async function initializeRAGWithJSONFiles(
   mathJsonPath: string,
   englishJsonPath: string,
-  totalBatches: number = 4
+  totalBatches: number = 20
 ): Promise<void> {
   console.log('[RAG] Initializing RAG system with JSON question banks...');
 

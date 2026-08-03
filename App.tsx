@@ -132,6 +132,12 @@ export default function App() {
   const [config, setConfig] = useState<TestProfileConfig | null>(null);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [questionsLoaded, setQuestionsLoaded] = useState(false);
+  // Live Question Bank data, fetched a page at a time from the server
+  // instead of pulling the whole collection into the browser.
+  const [bankQuestions, setBankQuestions] = useState<Question[]>([]);
+  const [bankTotal, setBankTotal] = useState(0);
+  const [bankLoading, setBankLoading] = useState(false);
+  const [debouncedSearch, setDebouncedSearch] = useState("");
   const [auditLogs, setAuditLogs] = useState<ValidationAuditLog[]>([]);
   const [pipelineRuns, setPipelineRuns] = useState<PipelineRun[]>([]);
   const [selectedRun, setSelectedRun] = useState<PipelineRun | null>(null);
@@ -173,6 +179,10 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(searchQuery), 300);
+    return () => clearTimeout(t);
+  }, [searchQuery]);
   const [statusFilter, setStatusFilter] = useState<string>("all");
   const [domainFilter, setDomainFilter] = useState<string>("all");
   // Date-range picker for exports — empty string means "no bound" on that side.
@@ -447,16 +457,47 @@ export default function App() {
     }
   };
 
+  const fetchBankPage = async () => {
+    setBankLoading(true);
+    try {
+      const params = new URLSearchParams({
+        exam_type: selectedExam,
+        page: String(bankPage + 1),
+        pageSize: String(BANK_PAGE_SIZE)
+      });
+      if (debouncedSearch) params.set("search", debouncedSearch);
+      if (statusFilter !== "all") params.set("status", statusFilter);
+      if (domainFilter !== "all") params.set("domain", domainFilter);
+      const res = await fetch(`/api/questions/page?${params.toString()}`);
+      const data = await res.json();
+      if (res.ok) {
+        setBankQuestions(data.questions);
+        setBankTotal(data.total);
+      }
+    } catch (e) {
+      console.error("Error fetching bank page:", e);
+    } finally {
+      setBankLoading(false);
+    }
+  };
+
   const fetchQuestions = async () => {
     try {
       fetchQuestionCounts();
       const uId = user ? user.uid : "public";
-      const res = await fetch(`/api/questions?exam_type=${selectedExam}&userId=${uId}`);
+      // Only escalated questions are pulled here in full — that's normally
+      // a small subset (human review queue). The Live Question Bank table
+      // itself is paginated separately via fetchBankPage(), which only
+      // pulls the ~25 rows actually on screen instead of the whole
+      // collection (that full fetch was the main cause of the multi-minute
+      // load time).
+      const res = await fetch(`/api/questions?exam_type=${selectedExam}&status=escalated&userId=${uId}`);
       const data = await res.json();
       if (res.ok) {
         setQuestions(data);
         setQuestionsLoaded(true);
       }
+      fetchBankPage();
     } catch (e) {
       console.error("Error fetching questions:", e);
     }
@@ -476,25 +517,23 @@ export default function App() {
   };
 
   const fetchPipelineRuns = async () => {
+    // The bulk `pipelineRuns` list state is never actually rendered
+    // anywhere — only `selectedRun` (one run) is. Fetching the 100 most
+    // recent full runs (each carrying its entire step-by-step log/debug
+    // history) on every load and every 800ms poll tick, just to pick one
+    // out by id, was the largest remaining source of load lag. Fetch only
+    // the run we actually care about.
+    const targetId = activeRunIdRef.current || selectedRun?.question_id;
+    if (!targetId) return;
     try {
-      const uId = user ? user.uid : "public";
-      const res = await fetch(`/api/pipeline-runs?userId=${uId}&exam_type=${selectedExam}`);
-      const data = await res.json();
-      if (res.ok) {
-        // Defensive re-filter in case selectedExam changed mid-flight
-        const filtered = data.filter((run: any) => run.exam_type?.toUpperCase() === selectedExam?.toUpperCase());
-        setPipelineRuns(filtered);
-
-        // Track the current active run by locked ID
-        if (activeRunIdRef.current) {
-          const matched = filtered.find((r: any) => r.question_id === activeRunIdRef.current);
-          if (matched) {
-            setSelectedRun(matched);
-            if (matched.status !== "running") {
-              setIsGenerating(false);
-              isGeneratingRef.current = false;
-            }
-          }
+      const res = await fetch(`/api/pipeline-runs/${targetId}`);
+      if (res.status === 404) return;
+      const matched = await res.json();
+      if (res.ok && matched) {
+        setSelectedRun(matched);
+        if (activeRunIdRef.current && matched.status !== "running") {
+          setIsGenerating(false);
+          isGeneratingRef.current = false;
         }
       }
     } catch (e) {
@@ -640,15 +679,10 @@ export default function App() {
         }
 
         try {
-          const uId = user ? user.uid : "public";
-          const runsRes = await fetch(`/api/pipeline-runs?userId=${uId}&exam_type=${selectedExam}`);
+          const runsRes = await fetch(`/api/pipeline-runs/${targetQId}`);
           if (runsRes.ok) {
-            const runsData = await runsRes.json();
-            const filtered = runsData.filter((run: any) => run.exam_type?.toUpperCase() === selectedExam?.toUpperCase());
-            setPipelineRuns(filtered);
-
+            const matched = await runsRes.json();
             if (targetQId && activeRunIdRef.current === targetQId) {
-              const matched = filtered.find((r: any) => r.question_id === targetQId);
               if (matched && matched.status !== "running") {
                 setSelectedRun(matched);
                 if (finalSyncIntervalRef.current) {
@@ -722,17 +756,24 @@ export default function App() {
         // Pin the tracker to the item currently running (matched by combo,
         // since question_id isn't assigned until the item finishes).
         try {
-          const uId = user ? user.uid : "public";
-          const runsRes = await fetch(`/api/pipeline-runs?userId=${uId}&exam_type=${selectedExam}`);
-          const runsData = await runsRes.json();
-          if (runsRes.ok) {
-            const filtered = runsData.filter((run: any) => run.exam_type?.toUpperCase() === selectedExam?.toUpperCase());
-            setPipelineRuns(filtered);
+          const currentItem = data.items.find((i) => i.status === "running");
+          const comboKey = currentItem
+            ? `${currentItem.section}|${currentItem.domain}|${currentItem.skill_tag}|${currentItem.difficulty}`
+            : null;
 
-            const currentItem = data.items.find((i) => i.status === "running");
-            const comboKey = currentItem
-              ? `${currentItem.section}|${currentItem.domain}|${currentItem.skill_tag}|${currentItem.difficulty}`
-              : null;
+          if (currentItem) {
+            const params = new URLSearchParams({
+              exam_type: selectedExam,
+              section: currentItem.section,
+              domain: currentItem.domain,
+              skill_tag: currentItem.skill_tag,
+              difficulty: currentItem.difficulty
+            });
+            const runsRes = await fetch(`/api/pipeline-runs/by-combo/lookup?${params.toString()}`);
+            if (runsRes.ok) {
+              const matched = await runsRes.json();
+              if (matched) setSelectedRun(matched);
+            }
 
             if (comboKey !== trackedBatchComboRef.current) {
               // Batch moved to a new item — clear immediately instead of
@@ -747,17 +788,6 @@ export default function App() {
               }
             }
 
-            if (currentItem) {
-              const matchingRun = filtered.find((run: any) =>
-                run.section === currentItem.section &&
-                run.domain === currentItem.domain &&
-                run.skill_tag === currentItem.skill_tag &&
-                run.difficulty === currentItem.difficulty
-              );
-              if (matchingRun) {
-                setSelectedRun(matchingRun);
-              }
-            }
             // No currentItem = between items or batch just finished. Stay
             // cleared rather than falling back to the previous item's run —
             // that fallback was what caused the old item to flash back on
@@ -782,19 +812,19 @@ export default function App() {
           trackedBatchComboRef.current = null;
 
           try {
-            const uId = user ? user.uid : "public";
-            const runsRes = await fetch(`/api/pipeline-runs?userId=${uId}&exam_type=${selectedExam}`);
-            const runsData = await runsRes.json();
-            if (runsRes.ok) {
-              const finishedItems = data.items.filter((i) => i.status === "completed" || i.status === "failed");
-              const lastItem = finishedItems[finishedItems.length - 1];
-              if (lastItem) {
-                const lastRun = runsData.find((run: any) =>
-                  run.section === lastItem.section &&
-                  run.domain === lastItem.domain &&
-                  run.skill_tag === lastItem.skill_tag &&
-                  run.difficulty === lastItem.difficulty
-                );
+            const finishedItems = data.items.filter((i) => i.status === "completed" || i.status === "failed");
+            const lastItem = finishedItems[finishedItems.length - 1];
+            if (lastItem) {
+              const params = new URLSearchParams({
+                exam_type: selectedExam,
+                section: lastItem.section,
+                domain: lastItem.domain,
+                skill_tag: lastItem.skill_tag,
+                difficulty: lastItem.difficulty
+              });
+              const runsRes = await fetch(`/api/pipeline-runs/by-combo/lookup?${params.toString()}`);
+              if (runsRes.ok) {
+                const lastRun = await runsRes.json();
                 if (lastRun) setSelectedRun(lastRun);
               }
             }
@@ -1258,39 +1288,25 @@ export default function App() {
     setEditChoices(updated);
   };
 
-  // Filter bank questions. Memoized — this was re-filtering the entire
-  // question list from scratch on every 800ms poll tick even when nothing
-  // about the list, search, or filters had changed.
-  const filteredQuestions = useMemo(() => (questions || []).filter((q: Question) => {
-    if (!q) return false;
-    const query = (searchQuery || "").toLowerCase();
-    const matchesSearch =
-      (q.question_text || "").toLowerCase().includes(query) ||
-      (q.passage || "").toLowerCase().includes(query) ||
-      (q.skill_tag || "").toLowerCase().includes(query) ||
-      (q.question_id || "").toLowerCase().includes(query);
-
-    const matchesStatus = statusFilter === "all" || q.status === statusFilter;
-    const matchesDomain = domainFilter === "all" || q.domain === domainFilter;
-
-    return matchesSearch && matchesStatus && matchesDomain;
-  }), [questions, searchQuery, statusFilter, domainFilter]);
-
   const escalatedQuestions = questions.filter((q: Question) => q.status === "escalated");
 
-  // Reset to page 1 whenever the filtered result set changes (new search,
-  // new filter, or the underlying data refreshing from a poll) so you're
-  // never silently stuck on a now-out-of-range page.
+  // Reset to page 1 whenever the filter set changes (new search, new
+  // filter, or the selected exam) so you're never silently stuck on a
+  // now-out-of-range page.
   useEffect(() => {
     setBankPage(0);
-  }, [searchQuery, statusFilter, domainFilter]);
+  }, [debouncedSearch, statusFilter, domainFilter, selectedExam]);
 
-  const bankPageCount = Math.max(1, Math.ceil(filteredQuestions.length / BANK_PAGE_SIZE));
+  // Fetch the current bank page whenever the page or any filter changes.
+  useEffect(() => {
+    fetchBankPage();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bankPage, debouncedSearch, statusFilter, domainFilter, selectedExam]);
+
+  const bankPageCount = Math.max(1, Math.ceil(bankTotal / BANK_PAGE_SIZE));
   const currentBankPage = Math.min(bankPage, bankPageCount - 1);
-  const paginatedBankQuestions = useMemo(
-    () => filteredQuestions.slice(currentBankPage * BANK_PAGE_SIZE, (currentBankPage + 1) * BANK_PAGE_SIZE),
-    [filteredQuestions, currentBankPage]
-  );
+  // Already the correct page, already filtered/sorted server-side.
+  const paginatedBankQuestions = bankQuestions;
 
   // Calculate QA stats
   const totalLogs = auditLogs.length;
@@ -1770,7 +1786,7 @@ export default function App() {
               <DbIcon className="w-4 h-4" />
               Live Question Bank
               <span className="ml-auto bg-slate-200 text-slate-600 px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold">
-                {questionsLoaded ? questions.length : (bankCounts ? bankCounts.total : "–")}
+                {bankCounts ? bankCounts.total : "–"}
               </span>
             </button>
 
@@ -1783,9 +1799,9 @@ export default function App() {
             >
               <UserCheck className="w-4 h-4" />
               Human Review Queue
-              {(questionsLoaded ? escalatedQuestions.length > 0 : (bankCounts ? bankCounts.escalated > 0 : false)) && (
+              {(bankCounts ? bankCounts.escalated > 0 : escalatedQuestions.length > 0) && (
                 <span className="ml-auto bg-amber-100 text-amber-700 border border-amber-200 px-1.5 py-0.5 rounded text-[10px] font-mono font-bold animate-pulse">
-                  {questionsLoaded ? escalatedQuestions.length : bankCounts?.escalated}
+                  {bankCounts ? bankCounts.escalated : escalatedQuestions.length}
                 </span>
               )}
             </button>
@@ -2715,7 +2731,12 @@ export default function App() {
                 </div>
 
                 {/* QUESTIONS LIST */}
-                {filteredQuestions.length > 0 ? (
+                {bankLoading && bankQuestions.length === 0 ? (
+                  <div className="flex flex-col items-center justify-center py-20 text-slate-400 border border-dashed border-slate-200 rounded-2xl bg-white shadow-sm">
+                    <DbIcon className="w-8 h-8 mb-2 text-slate-400 animate-pulse" />
+                    <p className="text-xs font-semibold text-slate-600">Loading questions…</p>
+                  </div>
+                ) : bankTotal > 0 ? (
                   <div className="flex flex-col gap-4">
                     {paginatedBankQuestions.map((q) => (
                       <div
@@ -2855,12 +2876,12 @@ export default function App() {
                 )}
 
                 {/* PAGINATION CONTROLS */}
-                {filteredQuestions.length > BANK_PAGE_SIZE && (
+                {bankTotal > BANK_PAGE_SIZE && (
                   <div className="flex items-center justify-between bg-white border border-slate-200/80 shadow-sm rounded-2xl px-4 py-3">
                     <span className="text-xs text-slate-500">
                       Showing <span className="font-semibold text-slate-700">{currentBankPage * BANK_PAGE_SIZE + 1}</span>
-                      –<span className="font-semibold text-slate-700">{Math.min((currentBankPage + 1) * BANK_PAGE_SIZE, filteredQuestions.length)}</span>
-                      {" "}of <span className="font-semibold text-slate-700">{filteredQuestions.length}</span> questions
+                      –<span className="font-semibold text-slate-700">{Math.min((currentBankPage + 1) * BANK_PAGE_SIZE, bankTotal)}</span>
+                      {" "}of <span className="font-semibold text-slate-700">{bankTotal}</span> questions
                     </span>
                     <div className="flex items-center gap-2">
                       <button
@@ -2870,8 +2891,22 @@ export default function App() {
                       >
                         Previous
                       </button>
-                      <span className="text-xs text-slate-500 font-mono">
-                        Page {currentBankPage + 1} / {bankPageCount}
+                      <span className="text-xs text-slate-500 font-mono flex items-center gap-1">
+                        Page
+                        <input
+                          type="number"
+                          min={1}
+                          max={bankPageCount}
+                          value={currentBankPage + 1}
+                          onChange={(e) => {
+                            const n = parseInt(e.target.value, 10);
+                            if (!Number.isNaN(n)) {
+                              setBankPage(Math.min(Math.max(n - 1, 0), bankPageCount - 1));
+                            }
+                          }}
+                          className="w-12 text-center border border-slate-200 rounded-md py-0.5 font-mono focus:outline-none focus:ring-1 focus:ring-slate-300"
+                        />
+                        / {bankPageCount}
                       </span>
                       <button
                         onClick={() => setBankPage(p => Math.min(bankPageCount - 1, p + 1))}

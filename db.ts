@@ -13,6 +13,41 @@ const BATCH_RUNS_COL = "batch_runs";
 
 export class Database {
 
+  private static buildQuestionQuery(filters?: {
+    exam_type?: string;
+    section?: string;
+    domain?: string;
+    status?: "approved" | "rejected" | "escalated";
+    search?: string;
+    dateFrom?: string;
+    dateTo?: string;
+  }): any {
+    const query: any = {};
+    if (filters?.exam_type) query.exam_type = { $regex: new RegExp(`^${filters.exam_type}$`, 'i') };
+    if (filters?.section) query.section = filters.section;
+    if (filters?.domain) query.domain = filters.domain;
+    if (filters?.status) query.status = filters.status;
+    if (filters?.dateFrom || filters?.dateTo) {
+      const range: any = {};
+      if (filters.dateFrom) range.$gte = `${filters.dateFrom}T00:00:00.000Z`;
+      if (filters.dateTo) range.$lte = `${filters.dateTo}T23:59:59.999Z`;
+      // created_at is stored as an ISO string (see generatorAgent.ts), so
+      // lexicographic string comparison lines up with chronological order.
+      query["metadata.created_at"] = range;
+    }
+    if (filters?.search) {
+      const safe = filters.search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const rx = new RegExp(safe, "i");
+      query.$or = [
+        { question_text: rx },
+        { passage: rx },
+        { skill_tag: rx },
+        { question_id: rx }
+      ];
+    }
+    return query;
+  }
+
   public static async getQuestions(filters?: {
     exam_type?: string;
     section?: string;
@@ -28,25 +63,14 @@ export class Database {
     dateTo?: string;
   }): Promise<Question[]> {
     const db = await getDb();
-    const query: any = {};
-    if (filters?.exam_type) query.exam_type = { $regex: new RegExp(`^${filters.exam_type}$`, 'i') };
-    if (filters?.section) query.section = filters.section;
-    if (filters?.domain) query.domain = filters.domain;
-    if (filters?.status) query.status = filters.status;
-    if (filters?.dateFrom || filters?.dateTo) {
-      const range: any = {};
-      if (filters.dateFrom) range.$gte = `${filters.dateFrom}T00:00:00.000Z`;
-      if (filters.dateTo) range.$lte = `${filters.dateTo}T23:59:59.999Z`;
-      // created_at is stored as an ISO string (see generatorAgent.ts), so
-      // lexicographic string comparison lines up with chronological order.
-      query["metadata.created_at"] = range;
-    }
+    const query = this.buildQuestionQuery(filters);
     const options: any = {};
     if (!filters?.includeEmbeddings) {
       options.projection = { embedding: 0 };
     }
-    // Newest questions first, so freshly generated questions show up on
-    // page 1 instead of the very last page of the bank.
+    // Newest first. Without this, Mongo returns natural/insertion order, so
+    // freshly-generated questions land at the END of the list — i.e. on the
+    // LAST page, not the first, since the client paginates this same order.
     let cursor = db.collection(QUESTIONS_COL).find(query, options).sort({ "metadata.created_at": -1 });
     if (filters?.limit) cursor = cursor.limit(filters.limit);
     const docs = await cursor.toArray();
@@ -57,20 +81,65 @@ export class Database {
     }));
   }
 
-  public static async getQuestionCounts(exam_type?: string): Promise<{ approved: number; escalated: number; total: number }> {
+  // Real server-side pagination: only pulls the ~25 docs actually shown on
+  // screen, plus a count for the current filter set, instead of the entire
+  // collection (2700+ docs, full explanation/rationale/metadata each) on
+  // every load and every 800ms poll tick. That full-collection fetch was
+  // the main cause of the ~2 minute Live Question Bank load time.
+  public static async getQuestionsPage(filters: {
+    exam_type?: string;
+    section?: string;
+    domain?: string;
+    status?: "approved" | "rejected" | "escalated";
+    search?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    page: number;      // 1-indexed
+    pageSize: number;
+  }): Promise<{ questions: Question[]; total: number }> {
+    const db = await getDb();
+    const query = this.buildQuestionQuery(filters);
+    const skip = Math.max(0, (filters.page - 1) * filters.pageSize);
+
+    const [docs, total] = await Promise.all([
+      db.collection(QUESTIONS_COL)
+        .find(query, { projection: { embedding: 0 } })
+        .sort({ "metadata.created_at": -1 })
+        .skip(skip)
+        .limit(filters.pageSize)
+        .toArray(),
+      db.collection(QUESTIONS_COL).countDocuments(query)
+    ]);
+
+    const questions = (docs as unknown as Question[]).map(q => ({
+      ...q,
+      question_text: cleanQuestionText(q.question_text)
+    }));
+    return { questions, total };
+  }
+
+  public static async getQuestionCounts(exam_type?: string): Promise<{ approved: number; escalated: number; rejected: number; total: number }> {
     const db = await getDb();
     const query: any = {};
     if (exam_type) query.exam_type = { $regex: new RegExp(`^${exam_type}$`, 'i') };
 
-    const [approved, escalated] = await Promise.all([
+    // total must count every status this collection can hold — the header
+    // count is shown from this fast endpoint before the full /api/questions
+    // list has loaded, then swapped for questions.length once it has. If
+    // this leaves out a status that the unfiltered /api/questions fetch
+    // includes (e.g. "rejected"), the number visibly jumps between the two
+    // as soon as the slow fetch resolves, on every single refresh.
+    const [approved, escalated, rejected] = await Promise.all([
       db.collection(QUESTIONS_COL).countDocuments({ ...query, status: "approved" }),
-      db.collection(QUESTIONS_COL).countDocuments({ ...query, status: "escalated" })
+      db.collection(QUESTIONS_COL).countDocuments({ ...query, status: "escalated" }),
+      db.collection(QUESTIONS_COL).countDocuments({ ...query, status: "rejected" })
     ]);
 
     return {
       approved,
       escalated,
-      total: approved + escalated
+      rejected,
+      total: approved + escalated + rejected
     };
   }
 
@@ -175,6 +244,34 @@ export class Database {
   public static async getPipelineRunById(question_id: string): Promise<PipelineRun | undefined> {
     const db = await getDb();
     const doc = await db.collection(PIPELINE_RUNS_COL).findOne({ question_id });
+    return doc ? (doc as unknown as PipelineRun) : undefined;
+  }
+
+  // Batch tracking pins the UI to whichever combo is currently running, but
+  // doesn't have a question_id for it until the item finishes — so it needs
+  // a lookup by combo instead of by id. Previously this meant fetching the
+  // 100 most recent full runs (every one's entire log history) and
+  // filtering client-side; this pulls back exactly one.
+  public static async getLatestPipelineRunByCombo(params: {
+    exam_type?: string;
+    section: string;
+    domain: string;
+    skill_tag: string;
+    difficulty: string;
+  }): Promise<PipelineRun | undefined> {
+    const db = await getDb();
+    const query: any = {
+      section: params.section,
+      domain: params.domain,
+      skill_tag: params.skill_tag,
+      difficulty: params.difficulty
+    };
+    if (params.exam_type) query.exam_type = params.exam_type;
+    const doc = await db.collection(PIPELINE_RUNS_COL)
+      .find(query)
+      .sort({ started_at: -1 })
+      .limit(1)
+      .next();
     return doc ? (doc as unknown as PipelineRun) : undefined;
   }
 

@@ -44,6 +44,7 @@ export interface Question {
   domain: string;
   skill_tag: string;
   difficulty: string;
+  passage_intro?: string | null;
   passage: string | null;
   stimulus: string | null;
   question_text: string;
@@ -57,6 +58,18 @@ export interface Question {
   validation?: ValidationBlock;
   metadata: QuestionMetadata;
   status: "approved" | "rejected" | "escalated";
+  // Which agent actually produced this question. "claude" = a real Claude
+  // generation. "simulated_fallback" = the Anthropic call failed (rate limit,
+  // timeout, auth, malformed response, etc.) and the pipeline substituted a
+  // canned template question instead. Simulated-fallback questions are never
+  // auto-approved (see pipeline.ts) — they always route to escalated — but
+  // this field lets the UI/export flag them explicitly so they can never be
+  // silently mistaken for real AI output.
+  // Optional because seed-bank questions (src/server/seedData.ts) are
+  // neither Claude-generated nor a simulated fallback — they're curated
+  // reference data and simply don't have this field. Anything produced by
+  // the live pipeline always sets it explicitly (see pipeline.ts).
+  generation_source?: "claude" | "simulated_fallback";
 }
 
 export interface Domain {
@@ -143,9 +156,14 @@ export interface BatchRunItem {
   domain: string;
   skill_tag: string;
   difficulty: string;
-  status: "pending" | "running" | "completed" | "failed" | "skipped";
+  status: "pending" | "running" | "completed" | "failed" | "cancelled" | "skipped";
   question_id?: string;
   question_status?: string;
+  // True when the final saved question for this item came from the
+  // simulated-fallback template rather than a real Claude generation
+  // (mirrors Question.generation_source, kept here too so the batch UI can
+  // flag it without a second DB round trip).
+  is_simulated?: boolean;
   error?: string;
   started_at?: string;
   finished_at?: string;
@@ -166,7 +184,17 @@ export interface BatchRun {
   // even when most of those 40 were actually escalated, not approved.
   approved: number;
   escalated: number;
+  // Real technical failures only: a thrown exception before/during
+  // generation (API error, item timeout, crashed call). Never includes
+  // user-initiated stops — see `cancelled` below — so this number always
+  // matches something you can trace to an actual error message via
+  // `item.error`.
   failed: number;
+  // Items that never got a chance to finish because the batch was stopped
+  // (the Stop button) while they were running. Previously these were
+  // counted under `failed`, which made "N failed" look like N technical
+  // errors when some of them were just stop-requests landing mid-item.
+  cancelled: number;
   status: "running" | "completed" | "completed_with_escalations" | "completed_with_errors" | "failed" | "stopped";
   items: BatchRunItem[];
   started_at: string;

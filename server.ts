@@ -42,6 +42,21 @@ ensureCollections()
 // synchronously the instant a request passes the check, closing that race.
 let batchInProgress = false;
 
+// Cleanup any orphaned batch runs left in "running" status from a previous killed server process
+Database.getBatchRuns({ status: "running" }).then(async (runningBatches) => {
+  for (const b of runningBatches) {
+    console.log(`[Startup Cleanup] Marking orphaned batch ${b.batch_id} as stopped.`);
+    b.status = "stopped";
+    b.finished_at = new Date().toISOString();
+    for (const item of b.items || []) {
+      if (item.status === "pending" || item.status === "running") {
+        item.status = "skipped";
+      }
+    }
+    await Database.saveBatchRun(b);
+  }
+}).catch(err => console.warn('[Startup Cleanup] Failed to cleanup running batches:', err));
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3002);
@@ -81,7 +96,7 @@ async function startServer() {
   app.get("/api/configs/:exam", (req, res) => {
     const exam = req.params.exam.toLowerCase();
     const configPath = path.join(process.cwd(), "configs", `${exam}.json`);
-    
+
     if (fs.existsSync(configPath)) {
       try {
         const configData = fs.readFileSync(configPath, "utf-8");
@@ -95,6 +110,16 @@ async function startServer() {
   });
 
   // Get list of questions in bank
+  app.get("/api/questions/counts", async (req, res) => {
+    try {
+      const { exam_type } = req.query;
+      const counts = await Database.getQuestionCounts(exam_type as string);
+      res.json(counts);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || "Failed to fetch question counts." });
+    }
+  });
+
   app.get("/api/questions", async (req, res) => {
     const { exam_type, section, domain, status, userId } = req.query;
     const questions = await Database.getQuestions({
@@ -105,9 +130,42 @@ async function startServer() {
     });
     res.json(questions);
   });
+  // Paginated variant — only pulls the current page from Mongo instead of
+  // the whole collection. Use this for the Live Question Bank table; use
+  // the plain /api/questions above only for small, fully-bounded sets
+  // (e.g. status=escalated, which is normally a small subset).
+  app.get("/api/questions/page", async (req, res) => {
+    try {
+      const { exam_type, section, domain, status, search } = req.query;
+      const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+      const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize as string, 10) || 25));
+      const result = await Database.getQuestionsPage({
+        exam_type: exam_type as string,
+        section: section as string,
+        domain: domain as string,
+        status: status as "approved" | "rejected" | "escalated",
+        search: search as string,
+        page,
+        pageSize
+      });
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || "Failed to fetch questions page." });
+    }
+  });
   app.get("/api/questions/export", async (req, res) => {
     const { toStagingFormatBulk } = await import("./src/server/formatter.js");
-    const questions = await Database.getQuestions({ status: "approved" });
+    const { from, to } = req.query;
+    if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from as string)) ||
+      (to && !/^\d{4}-\d{2}-\d{2}$/.test(to as string))) {
+      res.status(400).json({ error: "from/to must be dates in YYYY-MM-DD format." });
+      return;
+    }
+    const questions = await Database.getQuestions({
+      status: "approved",
+      dateFrom: from as string,
+      dateTo: to as string,
+    });
     const staging = toStagingFormatBulk(questions);
     res.json(staging);
   });
@@ -115,17 +173,24 @@ async function startServer() {
   // (approved / rejected / escalated), with full metadata intact.
   app.get("/api/questions/export-all", async (req, res) => {
     const { toStagingFormatWithStatusBulk } = await import("./src/server/formatter.js");
-    const { exam_type, section, domain } = req.query;
+    const { exam_type, section, domain, from, to } = req.query;
+    if ((from && !/^\d{4}-\d{2}-\d{2}$/.test(from as string)) ||
+      (to && !/^\d{4}-\d{2}-\d{2}$/.test(to as string))) {
+      res.status(400).json({ error: "from/to must be dates in YYYY-MM-DD format." });
+      return;
+    }
     const questions = await Database.getQuestions({
       exam_type: exam_type as string,
       section: section as string,
       domain: domain as string,
+      dateFrom: from as string,
+      dateTo: to as string,
     });
     res.json(toStagingFormatWithStatusBulk(questions));
   });
   // Generate question using Orchestration loop
   app.post("/api/questions/generate", async (req, res) => {
-    const { exam_type, section, domain, skill_tag, difficulty, userId } = req.body;
+    const { question_id, exam_type, section, domain, skill_tag, difficulty, userId } = req.body;
 
     if (!exam_type || !section || !domain || !skill_tag || !difficulty) {
       res.status(400).json({ error: "Missing required generation parameters." });
@@ -140,19 +205,44 @@ async function startServer() {
 
     try {
       const config = JSON.parse(fs.readFileSync(configPath, "utf-8"));
-      
-      const question = await runOrchestrationPipeline({
-        exam_type,
-        section,
-        domain,
-        skill_tag,
-        difficulty,
-        config,
-        userId
+
+      // Hard ceiling on the whole request. Without this, any hang inside the
+      // pipeline (a stuck model call, a dropped DB/RAG connection, etc.)
+      // holds this HTTP response open indefinitely — the client-side fetch
+      // would just spin forever, and since the frontend only clears its
+      // "generating" lock once the fetch settles, the UI would appear stuck
+      // until the page was refreshed. Racing against a timeout guarantees
+      // this route always responds, and requestPipelineRunStop tells the
+      // still-running pipeline (via the same stop_requested flag the Stop
+      // button uses) to wind down instead of continuing to burn attempts
+      // for a request the client has already given up on.
+      const GENERATE_TIMEOUT_MS = 600000; // 240s
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`TIMEOUT: Generation exceeded ${GENERATE_TIMEOUT_MS / 1000}s server-side budget.`));
+        }, GENERATE_TIMEOUT_MS);
       });
+
+      const question = await Promise.race([
+        runOrchestrationPipeline({
+          question_id,
+          exam_type,
+          section,
+          domain,
+          skill_tag,
+          difficulty,
+          config,
+          userId
+        }),
+        timeoutPromise
+      ]);
 
       res.json({ success: true, question });
     } catch (e: any) {
+      if (question_id) {
+        // Best-effort — don't let a stop-request failure mask the real error.
+        Database.requestPipelineRunStop(question_id).catch(() => { });
+      }
       console.error("Pipeline failure:", e);
       res.status(500).json({ error: e.message || "Pipeline error during generation." });
     }
@@ -289,6 +379,23 @@ async function startServer() {
     }
     const updated = await Database.requestBatchRunStop(req.params.batch_id);
     console.log(`[STOP] stop_requested set on batch doc. Confirmed value in DB: ${updated?.stop_requested}`);
+
+    if (!batchInProgress) {
+      // If no active in-memory batch process is running (e.g. server was restarted mid-run),
+      // mark the batch document as stopped in MongoDB immediately.
+      run.status = "stopped";
+      run.stop_requested = true;
+      run.finished_at = new Date().toISOString();
+      for (const item of run.items || []) {
+        if (item.status === "pending" || item.status === "running") {
+          item.status = "skipped";
+        }
+      }
+      await Database.saveBatchRun(run);
+      console.log(`[STOP] Orphaned batch ${run.batch_id} marked directly as stopped in DB.`);
+      res.json({ success: true, batch: run });
+      return;
+    }
 
     // Setting stop_requested on the BATCH only stops workers from picking up
     // NEW items — it does nothing for whichever item(s) are already in
@@ -640,6 +747,7 @@ async function startServer() {
         approved: 0,
         escalated: 0,
         failed: 0,
+        cancelled: 0,
         status: "running" as const,
         items,
         started_at: new Date().toISOString(),
@@ -688,6 +796,40 @@ async function startServer() {
   app.get("/api/pipeline-runs", async (req, res) => {
     const { exam_type } = req.query;
     res.json(await Database.getPipelineRuns({ exam_type: exam_type as string }));
+  });
+
+  // Single run by id — used to poll/refresh the one run actually on screen
+  // instead of pulling the 100 most recent full runs (each with its
+  // complete step-by-step log/debug history) just to find one by id.
+  app.get("/api/pipeline-runs/:question_id", async (req, res) => {
+    const run = await Database.getPipelineRunById(req.params.question_id);
+    if (!run) {
+      res.status(404).json({ error: "Pipeline run not found." });
+      return;
+    }
+    res.json(run);
+  });
+
+  // Latest run for a section/domain/skill/difficulty combo — batch tracking
+  // needs this before the running item has a question_id yet.
+  app.get("/api/pipeline-runs/by-combo/lookup", async (req, res) => {
+    const { exam_type, section, domain, skill_tag, difficulty } = req.query;
+    if (!section || !domain || !skill_tag || !difficulty) {
+      res.status(400).json({ error: "section, domain, skill_tag, and difficulty are required." });
+      return;
+    }
+    const run = await Database.getLatestPipelineRunByCombo({
+      exam_type: exam_type as string,
+      section: section as string,
+      domain: domain as string,
+      skill_tag: skill_tag as string,
+      difficulty: difficulty as string
+    });
+    if (!run) {
+      res.status(404).json({ error: "No matching pipeline run found." });
+      return;
+    }
+    res.json(run);
   });
 
   // Request that an in-progress single-question generation stop. The current

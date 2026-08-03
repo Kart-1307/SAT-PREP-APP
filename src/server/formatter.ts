@@ -8,6 +8,7 @@ import { Question } from '../types';
 export interface StagingQuestion {
   id: string;
   category: string;
+  passage_intro?: string | null;
   passage: string | null;
   stimulus: string | null;
   question: string;
@@ -54,14 +55,20 @@ function toStagingExplanation(explanation: Question['explanation']): string {
   return explanation.correct_rationale || '';
 }
 
+export function cleanQuestionText(text: string | null | undefined): string {
+  if (!text) return '';
+  return String(text).trim();
+}
+
 // The single source of truth for the transformation
 export function toStagingFormat(question: Question): StagingQuestion {
   return {
     id:             question.question_id,
     category:       question.domain,
+    passage_intro:  question.passage_intro ?? null,
     passage:        question.passage ?? null,
     stimulus:       question.stimulus ?? null,
-    question:       question.question_text,
+    question:       cleanQuestionText(question.question_text),
     choices:        toStagingChoices(question.answer_choices),
     correct_answer: question.correct_answer,
     explanation:    toStagingExplanation(question.explanation),
