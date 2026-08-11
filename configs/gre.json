@@ -118,7 +118,8 @@
     "min_composite_score": 90,
     "zero_tolerance_checks": [
       "correctness",
-      "originality"
+      "originality",
+      "difficulty_alignment"
     ],
     "checks": [
       {

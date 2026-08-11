@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { Database } from "./db";
 import { Question, ValidationBlock, ValidationAuditLog, PipelineRun, PipelineStepLog, CheckResult, AnswerChoice, BatchRun, BatchRunItem } from "../types";
 import fs from "fs";
@@ -57,96 +57,6 @@ export function checkQuestionCompleteness(q: Question): { complete: boolean; rea
   return { complete: true };
 }
 
-// Reusable, highly-resilient content generation function with exponential backoff retries and model fallbacks.
-// This handles transient 503 (Service Unavailable / high demand) and 429 (Rate Limit) errors perfectly.
-async function generateContentWithRetry(params: {
-  prompt: string;
-  systemPrompt: string;
-  preferredModel?: string;
-  responseMimeType?: string;
-  temperature?: number;
-}): Promise<any> {
-  const ai = getAI();
-  const preferred = params.preferredModel || "gemini-3.5-flash";
-  const modelsToTry = [preferred, "gemini-3.1-flash-lite", "gemini-flash-latest"];
-
-  let lastError: any = null;
-
-  for (const model of modelsToTry) {
-    let delay = 1000;
-    const maxRetries = 3;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-      try {
-        console.log(`[Gemini Pipeline API] Calling model: ${model} (Attempt ${attempt}/${maxRetries})`);
-        const res = await ai.models.generateContent({
-          model: model,
-          contents: params.prompt,
-          config: {
-            systemInstruction: params.systemPrompt,
-            responseMimeType: params.responseMimeType || "application/json",
-            temperature: params.temperature !== undefined ? params.temperature : 0.7
-          }
-        });
-        return res;
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err.message || "";
-        const errStatus = err.status || (err.error && err.error.code) || 0;
-
-        const isAuthError =
-          errStatus === 401 ||
-          errStatus === 403 ||
-          errMsg.includes("401") ||
-          errMsg.includes("403") ||
-          errMsg.toLowerCase().includes("unauthenticated") ||
-          errMsg.toLowerCase().includes("permission_denied") ||
-          errMsg.toLowerCase().includes("credential") ||
-          errMsg.toLowerCase().includes("api key") ||
-          errMsg.toLowerCase().includes("auth");
-
-        if (isAuthError) {
-          console.info("[Gemini Pipeline] API credentials are inactive or invalid. Seamlessly triggering simulated fallback.");
-          throw err;
-        }
-
-        console.warn(`[Gemini Pipeline API] Model ${model} on attempt ${attempt} returned: ${errMsg}`);
-
-        const isHighDemand =
-          errStatus === 503 ||
-          errMsg.includes("503") ||
-          errMsg.toLowerCase().includes("demand") ||
-          errMsg.toLowerCase().includes("unavailable") ||
-          errMsg.toLowerCase().includes("temporary");
-
-        if (isHighDemand) {
-          console.warn(`[Gemini Pipeline API] Model ${model} is experiencing high demand (503/UNAVAILABLE). Switching to the next model fallback immediately to prevent pipeline timeouts.`);
-          break; // Break the inner loop to immediately try the next model in modelsToTry!
-        }
-
-        // Only retry if it is a 429 rate limit or some other transient network/server error
-        const isRetryable =
-          errStatus === 429 ||
-          !errStatus ||
-          errMsg.includes("429") ||
-          errMsg.toLowerCase().includes("rate limit") ||
-          errMsg.toLowerCase().includes("quota");
-
-        if (!isRetryable || attempt === maxRetries) {
-          // If not retryable or we reached maximum attempts for this model, move to next model / finish
-          break;
-        }
-
-        console.log(`[Gemini Pipeline API] Retryable rate limit/quota error encountered. Retrying in ${delay}ms...`);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        delay *= 2; // exponential backoff
-      }
-    }
-  }
-
-  throw lastError || new Error("Failed to generate content after all retries and model fallbacks.");
-}
-
 // ----------------------------------------------------
 // Embedding & Similarity Helper
 // ----------------------------------------------------
@@ -202,10 +112,20 @@ export async function runSimilarityCheck(
       // the rest of the bank reuse each question's embedding, cached on it
       // the first time it was checked, instead of re-embedding the entire
       // bank (which is what made this step take 60+ seconds as the bank grew).
-      const resTarget = await ai.models.embedContent({
-        model: "gemini-embedding-2-preview",
-        contents: targetText,
-      });
+      // 12s hard timeout — this call had none before and doesn't retry, so a
+      // hung request could otherwise block a pipeline attempt indefinitely.
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 12000);
+      let resTarget;
+      try {
+        resTarget = await ai.models.embedContent({
+          model: "gemini-embedding-2-preview",
+          contents: targetText,
+          config: { abortSignal: controller.signal },
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
       targetVec = (resTarget as any).embedding?.values || (resTarget as any).embeddings?.values || (resTarget as any).embeddings?.[0]?.values;
 
       if (targetVec) {
@@ -881,7 +801,33 @@ export async function runOrchestrationPipeline(params: {
     started_at: new Date().toISOString()
   };
 
-  const addLog = async (type: PipelineStepLog["type"], message: string, details?: any) => {
+  // Every addLog() call used to `await Database.savePipelineRun(run)`
+  // directly — a full Mongo round-trip per log line, ~10+ per question,
+  // all blocking generation. That's what fixed the crash (errors were
+  // caught) but reintroduced the latency we're now removing.
+  //
+  // Fix: writes are chained onto this promise instead of awaited inline.
+  // Chaining (not just firing each one independently) preserves write
+  // ORDER — a fast write can never race ahead of and get overwritten by
+  // an earlier, slower one landing after it. Each write's own errors are
+  // swallowed inside persistRun so a DB hiccup can never escape as an
+  // unhandled rejection, matching the crash-safety of the previous fix.
+  let writeQueue: Promise<void> = Promise.resolve();
+
+  const persistRun = async (): Promise<void> => {
+    try {
+      await Database.savePipelineRun(run);
+    } catch (err) {
+      // A failed log write (e.g. Atlas replica election, transient network
+      // blip) must never abort real generation work. Log locally and move on.
+      console.error(`[PIPELINE ${qId}] savePipelineRun failed (non-fatal, continuing):`, err);
+    }
+  };
+
+  // Callers still `await addLog(...)` everywhere — that's fine and stays
+  // non-blocking, because this function itself doesn't await the DB write;
+  // it just appends to writeQueue and returns immediately.
+  const addLog = async (type: PipelineStepLog["type"], message: string, details?: any): Promise<void> => {
     const step: PipelineStepLog = {
       timestamp: new Date().toISOString(),
       type,
@@ -889,8 +835,15 @@ export async function runOrchestrationPipeline(params: {
       details
     };
     run.logs.push(step);
-    await Database.savePipelineRun(run);
+    writeQueue = writeQueue.then(persistRun);
     params.onUpdate?.(run);
+  };
+
+  // Call this right before any return/throw that hands the final result
+  // back to the caller, so the HTTP response never returns before the
+  // last log (including the terminal status) is actually persisted.
+  const flushLogs = async (): Promise<void> => {
+    await writeQueue;
   };
 
   await addLog("decision", `Starting Pipeline for ${exam_type} - ${section} - ${domain} (${skill_tag}). Max attempts = ${max_attempts}.`);
@@ -910,6 +863,7 @@ export async function runOrchestrationPipeline(params: {
       console.log(`[PIPELINE ${qId}] stop_requested=true detected before attempt ${currentAttempt} — cancelling.`);
       run.status = "cancelled";
       await addLog("decision", `Pipeline stopped by user before attempt ${currentAttempt}.`);
+      await flushLogs();
       throw new Error("CANCELLED: Generation stopped by user.");
     }
     run.current_attempt = currentAttempt;
@@ -1127,6 +1081,7 @@ export async function runOrchestrationPipeline(params: {
       run.status = "completed_pass";
       run.final_question = draftQuestion;
       await addLog("decision", `Pipeline SUCCESS on attempt ${currentAttempt}. Question approved and added to active bank.`);
+      await flushLogs();
       return draftQuestion;
     } else {
       const failureReason = validationBlock.validation_status !== "PASS"
@@ -1155,11 +1110,13 @@ export async function runOrchestrationPipeline(params: {
     run.status = "completed_escalated";
     run.final_question = questionToEscalate;
     await addLog("decision", `Orchestrator Limit Reached: Failed after ${max_attempts} attempts. Escalating to human-review queue with full history.`);
+    await flushLogs();
     return questionToEscalate;
   }
 
   run.status = "failed";
   await addLog("decision", "Pipeline terminated due to critical failures.");
+  await flushLogs();
   throw new Error("Pipeline failed to produce any question.");
 }
 
@@ -1259,14 +1216,44 @@ export async function createBatchRun(params: {
   return batch;
 }
 
-// Processes a previously-created BatchRun sequentially, one combination at a
-// time, reusing the exact same runOrchestrationPipeline used for single-question
-// generation (same RAG rotation/reset, same validation, same everything — this
-// is purely an orchestration wrapper, not a separate generation path).
+// Processes a previously-created BatchRun, reusing the exact same
+// runOrchestrationPipeline used for single-question generation (same RAG
+// rotation/reset, same validation, same everything).
 // Intended to be invoked without awaiting from the API route ("fire and forget"),
 // with progress persisted to MongoDB after every item so the UI can poll it.
-const BATCH_CONCURRENCY = 1;
-const BATCH_ITEM_TIMEOUT_MS = 120000;
+// Runs up to BATCH_GENERATION_CONCURRENCY items in parallel — safe because
+// buildAllCombinations() never repeats a combo within a batch (so no two
+// workers ever hit the same RAG rotation-tracking key), and item claiming
+// below has no `await` between read and increment.
+function getBatchConcurrency(): number {
+  const raw = parseInt(process.env.BATCH_GENERATION_CONCURRENCY || "3", 10);
+  if (!Number.isFinite(raw) || raw < 1) return 1;
+  return Math.min(raw, 8); // ceiling to avoid tripping API rate limits
+}
+
+// Must cover runOrchestrationPipeline's own REAL worst case per attempt, not
+// the ~132s estimate previously used here — that estimate only counted ONE
+// generator call, but generateChunk() actually makes THREE sequential Claude
+// calls per attempt (create_scenario_draft, solve_scenario,
+// generate_wrong_choices), each with its own 45s ceiling
+// (REQUEST_TIMEOUT_MS in generatorAgent.ts) = up to 135s, not 45s. Likewise
+// both embedText() calls (RAG retrieval + similarity check) can each retry
+// up to 3x at 12s + backoff = ~39s worst case, not the 12s "similarity
+// embed" figure previously assumed. Real worst case per attempt:
+//   3 generator calls (135s) + RAG embed (39s) + similarity embed (39s)
+//   + validator 3-model fallback chain (36s) = ~249s/attempt
+//   x max_attempts (3) = ~747s
+// The previous 600s ceiling (raised from 420s to match GENERATE_TIMEOUT_MS
+// in server.ts) still sat BELOW that real worst case — which is exactly why
+// Hard items (more likely to hit near-max latency and retries on every
+// step, since they're harder to draft/critique) kept getting killed and
+// marked "failed" instead of finishing. Raised to 900s (15 min) so it
+// comfortably covers the true ~747s worst case with margin.
+// NOTE: GENERATE_TIMEOUT_MS in server.ts must be raised to the same value —
+// it wraps the identical runOrchestrationPipeline call for the
+// single-question endpoint, so leaving it at 600000 there would just move
+// this same failure to that code path instead of fixing it.
+const BATCH_ITEM_TIMEOUT_MS = 900000;
 
 export async function processBatchRun(params: {
   batch: BatchRun;
@@ -1369,7 +1356,7 @@ export async function processBatchRun(params: {
     }
   };
 
-  const workerCount = Math.min(BATCH_CONCURRENCY, batch.items.length) || 1;
+  const workerCount = Math.min(getBatchConcurrency(), batch.items.length) || 1;
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
   if (stopRequested) {

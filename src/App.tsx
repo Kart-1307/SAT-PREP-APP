@@ -475,6 +475,35 @@ export default function App() {
     }
   };
 
+  // Poll the one active run by id, via the endpoint built for exactly this
+  // (see the /api/pipeline-runs/:question_id route comment on the server).
+  // Previously the live tracker polled the full 100-run list — every log
+  // line of every recent run — every 800ms just to pick out this one run,
+  // which is what made single-question generation feel slow and made the
+  // tracker appear to freeze (the inFlight guard silently skips a tick
+  // whenever the previous heavy fetch hasn't resolved yet).
+  const pollActiveRun = async (): Promise<PipelineRun | null> => {
+    const runId = activeRunIdRef.current;
+    if (!runId) return null;
+    try {
+      const res = await fetch(`/api/pipeline-runs/${runId}`);
+      if (res.ok) {
+        const run = await res.json();
+        setSelectedRun(run);
+        if (run.status !== "running") {
+          setIsGenerating(false);
+          isGeneratingRef.current = false;
+        }
+        return run;
+      }
+      // 404 is expected for the first tick or two, before the pipeline's
+      // first log write has landed — not an error.
+    } catch (e) {
+      console.error("Error polling active run:", e);
+    }
+    return null;
+  };
+
   const fetchPipelineRuns = async () => {
     try {
       const uId = user ? user.uid : "public";
@@ -517,7 +546,7 @@ export default function App() {
       if (inFlight) return;
       inFlight = true;
       try {
-        await Promise.all([fetchPipelineRuns(), fetchQuestions(), fetchAuditLogs()]);
+        await Promise.all([pollActiveRun(), fetchQuestions(), fetchAuditLogs()]);
       } finally {
         inFlight = false;
       }
@@ -564,7 +593,9 @@ export default function App() {
       // and only a full page refresh (which remounts the component and resets
       // the ref) could unblock the next generation.
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 610000); // 130s
+      // 610s — just past the server's own 600s GENERATE_TIMEOUT_MS, so the
+      // server times out and responds first; this abort is a backstop.
+      const timeoutId = setTimeout(() => controller.abort(), 610000); // 610s (~10.2 min)
       let res: Response;
       try {
         res = await fetch("/api/questions/generate", {
@@ -609,7 +640,7 @@ export default function App() {
       }
     } catch (e: any) {
       if (e?.name === "AbortError") {
-        setErrorMsg("Generation timed out after 130s and was cancelled client-side. The server may still finish the attempt in the background — check the Bank tab in a moment.");
+        setErrorMsg("Generation timed out after 610s (~10 minutes) and was cancelled client-side. The server may still finish the attempt in the background — check the Bank tab in a moment.");
       } else {
         setErrorMsg("Network error trying to contact the generation pipeline.");
       }
@@ -639,28 +670,15 @@ export default function App() {
           return;
         }
 
-        try {
-          const uId = user ? user.uid : "public";
-          const runsRes = await fetch(`/api/pipeline-runs?userId=${uId}&exam_type=${selectedExam}`);
-          if (runsRes.ok) {
-            const runsData = await runsRes.json();
-            const filtered = runsData.filter((run: any) => run.exam_type?.toUpperCase() === selectedExam?.toUpperCase());
-            setPipelineRuns(filtered);
-
-            if (targetQId && activeRunIdRef.current === targetQId) {
-              const matched = filtered.find((r: any) => r.question_id === targetQId);
-              if (matched && matched.status !== "running") {
-                setSelectedRun(matched);
-                if (finalSyncIntervalRef.current) {
-                  clearInterval(finalSyncIntervalRef.current);
-                  finalSyncIntervalRef.current = null;
-                }
-                stopPollingRuns();
-                return;
-              }
-            }
+        const matched = await pollActiveRun();
+        if (matched && matched.status !== "running") {
+          if (finalSyncIntervalRef.current) {
+            clearInterval(finalSyncIntervalRef.current);
+            finalSyncIntervalRef.current = null;
           }
-        } catch { /* ignore */ }
+          stopPollingRuns();
+          return;
+        }
 
         if (checks >= 5) {
           if (finalSyncIntervalRef.current) {
@@ -708,7 +726,12 @@ export default function App() {
   // Poll a single batch run by id until it finishes
   const pollBatchRun = (batchId: string) => {
     stopBatchPolling();
+    // Same guard as startPollingRuns: skip a tick if the previous one's
+    // fetches haven't resolved yet, instead of piling requests on top.
+    let inFlight = false;
     batchPollIntervalRef.current = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const res = await fetch(`/api/batch-runs/${batchId}`);
         if (!res.ok) return;
@@ -819,6 +842,8 @@ export default function App() {
         }
       } catch (e) {
         console.error("Error polling batch run:", e);
+      } finally {
+        inFlight = false;
       }
     }, 1500);
   };

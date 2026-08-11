@@ -28,6 +28,9 @@ function l2Normalize(vec: number[]): number[] {
 
 export async function embedText(text: string): Promise<number[] | null> {
   const maxRetries = 3;
+  // Hard per-call timeout — this had none before and could hang far longer
+  // than any outer budget (pipeline attempt, batch item) accounted for.
+  const REQUEST_TIMEOUT_MS = 12000;
   let lastError: any = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -35,13 +38,21 @@ export async function embedText(text: string): Promise<number[] | null> {
       console.log(`[Embeddings] Embedding text (Attempt ${attempt}/${maxRetries})...`);
       const ai = getAI();
 
-      const res = await ai.models.embedContent({
-        model: 'gemini-embedding-001', // GA/stable. Swap to 'gemini-embedding-2-preview' later if you want, but "preview" can change without notice.
-        contents: text,
-        config: {
-          outputDimensionality: EMBEDDING_DIMENSIONS,
-        },
-      });
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      let res;
+      try {
+        res = await ai.models.embedContent({
+          model: 'gemini-embedding-001', // GA/stable. Swap to 'gemini-embedding-2-preview' later if you want, but "preview" can change without notice.
+          contents: text,
+          config: {
+            outputDimensionality: EMBEDDING_DIMENSIONS,
+            abortSignal: controller.signal,
+          },
+        });
+      } finally {
+        clearTimeout(timeoutId);
+      }
 
       const vec =
         (res as any).embeddings?.[0]?.values ||
@@ -65,7 +76,11 @@ export async function embedText(text: string): Promise<number[] | null> {
 
     } catch (err: any) {
       lastError = err;
-      if (err.status === 429 || err.status === 503) {
+      const isTimeout = err.name === "AbortError" || String(err.message || "").toLowerCase().includes("abort");
+      if (isTimeout) {
+        console.warn(`[Embeddings] Attempt ${attempt}: timed out after ${REQUEST_TIMEOUT_MS / 1000}s. Retrying...`);
+        if (attempt < maxRetries) await new Promise(r => setTimeout(r, 1000));
+      } else if (err.status === 429 || err.status === 503) {
         console.warn(`[Embeddings] Attempt ${attempt}: Service overloaded (${err.status}). Retrying in 2s...`);
         if (attempt < maxRetries) await new Promise(r => setTimeout(r, 2000));
       } else {

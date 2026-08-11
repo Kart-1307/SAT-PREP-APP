@@ -213,7 +213,8 @@ export async function retrieveExemplarQuestionsForGeneration(params: {
       collectionName,
       queryEmbedding,
       topK,
-      usedForKey
+      usedForKey,
+      difficulty
     );
 
     if (results.length < topK) {
@@ -224,7 +225,17 @@ export async function retrieveExemplarQuestionsForGeneration(params: {
       } catch (e) {
         console.warn('[RAG] Could not reset tracking:', e);
       }
-      results = await searchSimilarQuestions(collectionName, queryEmbedding, topK);
+      results = await searchSimilarQuestions(collectionName, queryEmbedding, topK, [], difficulty);
+    }
+
+    // Last-resort fallback: if this domain/skill genuinely has no bank
+    // questions at the requested difficulty, don't silently hand the
+    // generator zero exemplars (which itself invites drift) — fall back to
+    // an unfiltered search, but log it loudly since it means the exemplars
+    // shown may not match the requested difficulty.
+    if (results.length === 0) {
+      console.warn(`[RAG] No "${difficulty}" exemplars found for "${trackingKey}" — falling back to difficulty-unfiltered search.`);
+      results = await searchSimilarQuestions(collectionName, queryEmbedding, topK, usedForKey);
     }
 
     const pickedIds = results.map(r => r.data.question_id as string);

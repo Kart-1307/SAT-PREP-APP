@@ -2,7 +2,9 @@ import { GoogleGenAI } from '@google/genai';
 import getLangfuse from '../langfuse';
 import { Question, PipelineStepLog, ValidationBlock, CheckResult } from '../../types';
 
-const VALIDATOR_MODEL = "gemini-3.5-flash";
+// Label only — the actual model used per call is decided by the fallback
+// chain in generateContentWithRetry and recorded on the Langfuse trace below.
+const VALIDATOR_MODEL = "gemini-3.1-flash-lite";
 
 let aiClient: GoogleGenAI | null = null;
 
@@ -53,11 +55,12 @@ async function generateContentWithRetry(params: {
   temperature?: number;
 }): Promise<any> {
   const ai = getAI();
-  // VALIDATOR_MODEL *is* "gemini-2.5-flash" — listing it twice meant that
-  // after the first 12s timeout, this retried the exact same model that had
-  // just failed instead of moving to a genuinely different one, doubling
-  // the wasted wait before ever reaching gemini-1.5-flash.
-  const modelsToTry = ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
+  // gemini-3.1-flash-lite goes first: it's the one with working quota (see
+  // VALIDATOR_MODEL below). gemini-3.5-flash was previously listed first and
+  // hit its quota limit on every single call, so every validation wasted a
+  // full round-trip + retry delay before falling through to the model that
+  // actually works.
+  const modelsToTry = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"];
   let lastError: any = null;
 
   for (const model of modelsToTry) {
@@ -85,7 +88,7 @@ async function generateContentWithRetry(params: {
           clearTimeout(timeoutId);
         }
 
-        return res;
+        return { res, modelUsed: model };
 
       } catch (err: any) {
         lastError = err;
@@ -364,11 +367,11 @@ function extractJSON(raw: string): string {
 export async function runValidatorAgent(params: {
   question: Question;
   config: any;
-  onStep?: (log: PipelineStepLog) => void;
+  onStep?: (log: PipelineStepLog) => void | Promise<void>;
 }): Promise<ValidationBlock> {
   const { question, config, onStep } = params;
 
-  onStep?.({
+  await onStep?.({
     timestamp: new Date().toISOString(),
     type: "validate",
     message: "Agent 2: Starting independent, multi-dimension validation. (Generator thoughts are hidden from Agent 2)."
@@ -462,12 +465,16 @@ ${stimulusNote}${JSON.stringify(question, null, 2)}`;
 
     let res;
     try {
-      res = await generateContentWithRetry({
+      const result = await generateContentWithRetry({
         prompt,
         systemPrompt,
         responseMimeType: "application/json",
         temperature: 0.1
       });
+      res = result.res;
+      // Record which model in the fallback chain actually served this call
+      // (not necessarily VALIDATOR_MODEL) so Langfuse traces reflect reality.
+      generation.update({ model: result.modelUsed });
     } catch (err: any) {
       // Log failure to Langfuse before letting the outer catch fall back
       // to simulated validation, same pattern as the generator agent.

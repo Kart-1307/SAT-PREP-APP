@@ -26,27 +26,28 @@ export function getQdrantClient(): QdrantClient {
   return client;
 }
 
-// Creates a payload index on "question_id" so it can be used in search
+// Creates a payload index on the given field so it can be used in search
 // filters (must_not / match). Qdrant requires an explicit index before a
 // field can be filtered on — without this, any search that excludes IDs
-// (e.g. RAG rotation tracking) fails with "Index required but not found".
+// (e.g. RAG rotation tracking) or filters on a field (e.g. difficulty)
+// fails with "Index required but not found".
 // Safe to call on every startup: if the index already exists, Qdrant
 // returns a harmless error which we swallow here.
-async function ensurePayloadIndex(collectionName: string): Promise<void> {
+async function ensurePayloadIndex(collectionName: string, fieldName: string): Promise<void> {
   const qdrant = getQdrantClient();
   try {
     await qdrant.createPayloadIndex(collectionName, {
-      field_name: 'question_id',
+      field_name: fieldName,
       field_schema: 'keyword',
     });
-    console.log(`[Qdrant] Payload index ensured on "question_id" for ${collectionName}`);
+    console.log(`[Qdrant] Payload index ensured on "${fieldName}" for ${collectionName}`);
   } catch (error: any) {
     // Already exists → Qdrant returns a 4xx here, which is fine to ignore.
     const msg = error?.message || String(error);
     if (msg.toLowerCase().includes('already exists')) {
-      console.log(`[Qdrant] Payload index already exists on "question_id" for ${collectionName}`);
+      console.log(`[Qdrant] Payload index already exists on "${fieldName}" for ${collectionName}`);
     } else {
-      console.error(`[Qdrant] Error creating payload index for ${collectionName}:`, error);
+      console.error(`[Qdrant] Error creating payload index for ${collectionName} field "${fieldName}":`, error);
     }
   }
 }
@@ -64,7 +65,8 @@ export async function createMathCollection(): Promise<void> {
     } else {
       console.log(`[Qdrant] Collection already exists: ${MATH_COLLECTION_NAME}`);
     }
-    await ensurePayloadIndex(MATH_COLLECTION_NAME);
+    await ensurePayloadIndex(MATH_COLLECTION_NAME, 'question_id');
+    await ensurePayloadIndex(MATH_COLLECTION_NAME, 'difficulty');
   } catch (error) {
     console.error(`[Qdrant] Error creating math collection:`, error);
   }
@@ -83,16 +85,35 @@ export async function createEnglishCollection(): Promise<void> {
     } else {
       console.log(`[Qdrant] Collection already exists: ${ENGLISH_COLLECTION_NAME}`);
     }
-    await ensurePayloadIndex(ENGLISH_COLLECTION_NAME);
+    await ensurePayloadIndex(ENGLISH_COLLECTION_NAME, 'question_id');
+    await ensurePayloadIndex(ENGLISH_COLLECTION_NAME, 'difficulty');
   } catch (error) {
     console.error(`[Qdrant] Error creating English collection:`, error);
   }
 }
 
+// Cached as a promise (same pattern as getDb() in mongoClient.ts) rather than
+// a plain boolean, so concurrent callers during a batch run all await the
+// same in-flight check instead of each firing their own getCollections() +
+// createPayloadIndex round-trips. Previously this ran on every single
+// question generated (RAG retrieval calls it per-question), which is what
+// produced the "[Qdrant] Collection already exists" spam before every
+// generation in the logs.
+let collectionsReadyPromise: Promise<void> | null = null;
+
 export async function ensureCollections(): Promise<void> {
-  await createMathCollection();
-  await createEnglishCollection();
-  console.log('[Qdrant] Both collections ready');
+  if (!collectionsReadyPromise) {
+    collectionsReadyPromise = (async () => {
+      await createMathCollection();
+      await createEnglishCollection();
+      console.log('[Qdrant] Both collections ready');
+    })().catch((err) => {
+      // Don't cache a failed attempt — let the next call retry from scratch.
+      collectionsReadyPromise = null;
+      throw err;
+    });
+  }
+  return collectionsReadyPromise;
 }
 
 // Stores the FULL question object as payload (spread), so Math-only fields
@@ -136,18 +157,18 @@ export async function searchSimilarQuestions(
   collectionName: string,
   queryEmbedding: number[],
   topK: number = 3,
-  excludeIds: string[] = []
+  excludeIds: string[] = [],
+  requiredDifficulty?: string
 ): Promise<any[]> {
   const qdrant = getQdrantClient();
   try {
-    const filter = excludeIds.length > 0
-      ? {
-          must_not: [{
-            key: 'question_id',
-            match: { any: excludeIds },
-          }],
-        }
+    const must = requiredDifficulty
+      ? [{ key: 'difficulty', match: { value: requiredDifficulty } }]
       : undefined;
+    const mustNot = excludeIds.length > 0
+      ? [{ key: 'question_id', match: { any: excludeIds } }]
+      : undefined;
+    const filter = (must || mustNot) ? { must, must_not: mustNot } : undefined;
 
     const results = await qdrant.search(collectionName, {
       vector: queryEmbedding,

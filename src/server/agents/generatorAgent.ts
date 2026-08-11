@@ -183,6 +183,17 @@ interface SolvedScenario {
   exact_computed_answer: string;
   step_by_step_solution: string;
   explanation: string;
+  verification?: {
+    equation_lhs: string;
+    equation_rhs: string;
+    // Single-variable equations use a plain string/number (e.g. 'x', 6).
+    // Multi-variable systems (e.g. "Linear equations in two variables")
+    // use parallel arrays instead (e.g. ['x','y'], [6, 2]) so
+    // mathSanityCheck.ts can build a scope with every symbol the equation
+    // actually references, rather than throwing "Undefined symbol y".
+    variable: string | string[];
+    variable_value: number | number[];
+  } | null;
 }
 
 interface WrongChoices {
@@ -391,8 +402,8 @@ const SCENARIO_DRAFT_SCHEMA: Anthropic.Tool.InputSchema = {
   type: "object",
   properties: {
     passage_intro: { type: "string", description: "1-line context introduction sentence (e.g. 'The following excerpt is from...')" },
-    passage: { type: "string", description: "Reading passage text if English/Reading, or null if stand-alone question" },
-    stimulus: { type: "string", description: "Mathematical data table with preamble, shared parameters, or null" },
+    passage: { type: ["string", "null"], description: "Reading passage text if English/Reading. Omit this field entirely, or set it to JSON null, for stand-alone questions — never the string \"null\"." },
+    stimulus: { type: ["string", "null"], description: "Mathematical data table with preamble, shared parameters. Omit this field entirely, or set it to JSON null, if there is none — never the string \"null\"." },
     question_text: { type: "string", description: "The actual formal, unambiguous question prompt being asked." },
   },
   required: ["question_text"],
@@ -404,6 +415,38 @@ const SOLVED_SCENARIO_SCHEMA: Anthropic.Tool.InputSchema = {
     exact_computed_answer: { type: "string", description: "The exact final solved numerical or text value." },
     step_by_step_solution: { type: "string", description: "Detailed step-by-step mathematical or textual derivation." },
     explanation: { type: "string", description: "Student-friendly explanation of the correct logic." },
+    verification: {
+      type: ["object", "null"],
+      description:
+        "OPTIONAL, math only: one or more checkable equations that become true when exact_computed_answer is substituted in. " +
+        "Provide this whenever the question reduces to a clean equation or system of equations (e.g. a linear/quadratic equation, " +
+        "a formula plug-in, or a two-variable system like 'linear equations in two variables'). Omit it (or set null) for geometry, " +
+        "word problems without one clean equation, or non-numeric/text answers — the Validator will review those instead. " +
+        "equation_lhs/equation_rhs must be plain math-expression strings evaluable by a calculator (e.g. '2*x + 3*y', '15'). " +
+        "Do NOT use function notation like 'f(x)', 'g(x)', or 'f(3)' in equation_lhs/equation_rhs — substitute the underlying algebraic expression (e.g. '3*x - 12') instead. " +
+        "For a SINGLE variable, set 'variable' to a string (e.g. 'x') and 'variable_value' to a number matching " +
+        "exact_computed_answer. For a SYSTEM WITH MULTIPLE VARIABLES (e.g. x and y), set 'variable' to an array of the " +
+        "variable names (e.g. ['x','y']) and 'variable_value' to an array of their numeric values in the SAME ORDER " +
+        "(e.g. [6, 2]) — both arrays must be the same length.",
+      properties: {
+        equation_lhs: { type: "string", description: "Left-hand side expression, e.g. '2*x + 3*y'." },
+        equation_rhs: { type: "string", description: "Right-hand side expression, e.g. '15'." },
+        variable: {
+          description: "Either a single variable name (string) or an array of variable names for a multi-variable system.",
+          anyOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+        variable_value: {
+          description: "Either a single numeric value (matches a scalar 'variable') or an array of numeric values in the same order as 'variable'.",
+          anyOf: [
+            { type: "number" },
+            { type: "array", items: { type: "number" } },
+          ],
+        },
+      },
+    },
   },
   required: ["exact_computed_answer", "step_by_step_solution", "explanation"],
 };
@@ -543,7 +586,18 @@ CRITICAL FORMATTING RULE for "exact_computed_answer": output ONLY the raw value 
 label, even if the question presents candidate equations/options as A/B/C/D — this field
 is compared programmatically against the answer choices and any leading "A) ", "B) ",
 "Option C:", etc. will corrupt that mapping. Put any such reasoning about which lettered
-option matches inside "step_by_step_solution" instead, never inside "exact_computed_answer".`;
+option matches inside "step_by_step_solution" instead, never inside "exact_computed_answer".
+
+${params.subject === 'Math' ? `If this question reduces to one clean, calculator-checkable equation, also fill in
+"verification" with that equation (equation_lhs, equation_rhs, variable, variable_value) so
+your answer can be double-checked deterministically — variable_value must match
+exact_computed_answer numerically. If the question involves a SYSTEM with multiple unknowns
+(e.g. "linear equations in two variables"), set "variable" to an array of all the variable
+names involved (e.g. ["x","y"]) and "variable_value" to an array of their numeric values in
+the same order (e.g. [6, 2]) — do NOT omit "verification" just because there is more than
+one variable.IMPORTANT: Never use function notation like "f(x)" or "g(t)" in equation_lhs/equation_rhs; write the actual algebraic expression (e.g. "3*x - 12") so mathjs can calculate it without undefined symbol errors.
+ Omit "verification" entirely only for geometry or anything without one clean,
+checkable equation.` : ''}`;
 
   return await callClaudeWithTool<SolvedScenario>(
     systemPrompt,
@@ -624,6 +678,13 @@ function assembleChoices(
   const stripChoiceLabel = (s: string): string =>
     s.replace(/^\s*(?:[A-D]|Option [A-D])[).:]\s*/i, '').trim();
 
+  // Defensive normalizer: even with the schema now correctly typed as
+  // ["string","null"], guard against the model still emitting the literal
+  // string "null" (or an empty/whitespace value) for passage/stimulus —
+  // these should render as no passage/stimulus at all, not a "null" box.
+  const cleanNullable = (v?: string | null): string | null =>
+    !v || v.trim().toLowerCase() === 'null' ? null : v;
+
   const rawAnswer = solved?.exact_computed_answer || (solved as any)?.exact_answer || (solved as any)?.computed_answer || (solved as any)?.answer || '';
   const computedAnswer = stripChoiceLabel(String(rawAnswer)) || 'Option A';
 
@@ -659,7 +720,7 @@ function assembleChoices(
 
   // Shuffle correct answer and distractors deterministically/randomly
   const allChoices: string[] = [computedAnswer, ...uniqueDistractors];
-  
+
   // Custom shuffle function (Fisher-Yates)
   for (let i = allChoices.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
@@ -678,7 +739,10 @@ function assembleChoices(
 
   const distractorRationale: Record<string, string> = {};
   distList.forEach((d: any) => {
-    const choiceText = String(d?.choice_text || d?.text || d || '').trim();
+    // Same defensive strip used to build uniqueDistractors/answerChoices above —
+    // without it, a stray "B) " prefix here would silently break the match
+    // against the already-stripped answerChoices text and drop the rationale.
+    const choiceText = stripChoiceLabel(String(d?.choice_text || d?.text || d || ''));
     const matchedChoice = answerChoices.find(c => c.text === choiceText);
     if (matchedChoice) {
       distractorRationale[matchedChoice.id] = d?.rationale || 'Plausible distractor trap.';
@@ -691,6 +755,15 @@ function assembleChoices(
     exact_computed_answer: computedAnswer,
     step_by_step_solution: solved?.step_by_step_solution || '',
   };
+  if (
+    solved?.verification &&
+    solved.verification.equation_lhs &&
+    solved.verification.equation_rhs &&
+    solved.verification.variable &&
+    solved.verification.variable_value !== undefined
+  ) {
+    examSpecific.verification = solved.verification;
+  }
 
   const rawQuestionText = draft?.question_text || '';
   const questionText = rawQuestionText.trim();
@@ -702,8 +775,8 @@ function assembleChoices(
     domain: params.domain,
     skill_tag: params.skill,
     difficulty: params.difficulty,
-    passage: draft?.passage || null,
-    stimulus: draft?.stimulus || null,
+    passage: cleanNullable(draft?.passage),
+    stimulus: cleanNullable(draft?.stimulus),
     question_text: questionText,
     answer_choices: answerChoices,
     correct_answer: correctLetter,
@@ -777,7 +850,7 @@ export async function runGeneratorAgent(params: {
   studentLevel?: string;
   examType?: string;
   attempt?: number;
-  onStep?: (log: PipelineStepLog) => void;
+  onStep?: (log: PipelineStepLog) => void | Promise<void>;
   feedback?: string;
   count?: number;       // total questions wanted, default 50
   chunkSize?: number;    // questions per Claude call, default 10
@@ -807,7 +880,7 @@ export async function runGeneratorAgent(params: {
     },
   });
 
-  onStep?.({
+  await onStep?.({
     timestamp: new Date().toISOString(),
     type: 'draft',
     message: `Generator Agent: Starting generation of ${count} question(s) for ${examType} ${subject} / ${domain} / ${skill} / ${difficulty}`,
@@ -824,14 +897,14 @@ export async function runGeneratorAgent(params: {
       topK: 3,
     });
 
-    onStep?.({
+    await onStep?.({
       timestamp: new Date().toISOString(),
       type: 'rag_retrieval',
       message: `RAG: Retrieved ${exemplars.length} exemplar(s) for "${domain} / ${skill} / ${difficulty}".`,
     });
 
   } catch {
-    onStep?.({
+    await onStep?.({
       timestamp: new Date().toISOString(),
       type: 'rag_retrieval',
       message: 'RAG: Skipped (unavailable). Using config-only generation.',
@@ -849,7 +922,7 @@ export async function runGeneratorAgent(params: {
     remaining -= size;
   }
 
-  onStep?.({
+  await onStep?.({
     timestamp: new Date().toISOString(),
     type: 'draft',
     message: `Generator Agent: Split into ${chunkSizes.length} chunk(s) of up to ${chunkSize} questions each.`,
@@ -862,7 +935,7 @@ export async function runGeneratorAgent(params: {
   for (let i = 0; i < chunkSizes.length; i++) {
     const size = chunkSizes[i];
     try {
-      onStep?.({
+      await onStep?.({
         timestamp: new Date().toISOString(),
         type: 'draft',
         message: `Generator Agent: Requesting chunk ${i + 1}/${chunkSizes.length} (${size} questions)...`,
@@ -878,7 +951,7 @@ export async function runGeneratorAgent(params: {
       if (chunkQuestions.length === 0) {
         errors.push(`Chunk ${i + 1} returned no valid questions.`);
       } else if (chunkQuestions.length < size) {
-        onStep?.({
+        await onStep?.({
           timestamp: new Date().toISOString(),
           type: 'draft',
           message: `Generator Agent: Chunk ${i + 1} returned ${chunkQuestions.length}/${size} questions (partial — likely truncation).`,
@@ -890,7 +963,7 @@ export async function runGeneratorAgent(params: {
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       errors.push(`Chunk ${i + 1} failed: ${msg}`);
-      onStep?.({
+      await onStep?.({
         timestamp: new Date().toISOString(),
         type: 'draft',
         message: `Generator Agent: Chunk ${i + 1}/${chunkSizes.length} failed — ${msg}`,
@@ -899,7 +972,7 @@ export async function runGeneratorAgent(params: {
   }
 
   if (allQuestions.length === 0) {
-    onStep?.({
+    await onStep?.({
       timestamp: new Date().toISOString(),
       type: 'finalize',
       message: `Generator Agent: Batch generation failed — no questions produced. Errors: ${errors.join(' | ')}`,
@@ -907,7 +980,7 @@ export async function runGeneratorAgent(params: {
     throw new Error(`Batch generation failed for all chunks: ${errors.join(' | ')}`);
   }
 
-  onStep?.({
+  await onStep?.({
     timestamp: new Date().toISOString(),
     type: 'finalize',
     message: `Generator Agent: Batch generation complete. ${allQuestions.length}/${count} questions produced${errors.length ? ` (${errors.length} chunk error(s))` : ''}.`,

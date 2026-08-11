@@ -19,9 +19,9 @@ getDb()
   .then(() => console.log('[MongoDB] Connection warmed at startup.'))
   .catch(err => console.error('[MongoDB] Startup connection failed:', err));
 
-// All questions are already embedded in Qdrant (done via scripts/resumeIndexing.ts,
-// which diffs directly against Qdrant). No more batch-by-batch indexing needed at
-// boot — just confirm the collections exist and report how many questions are ready.
+// All questions are already embedded in Qdrant. No batch-by-batch indexing
+// needed at boot — just confirm the collections exist and report how many
+// questions are ready.
 ensureCollections()
   .then(async () => {
     const [math, english] = await Promise.all([
@@ -216,7 +216,7 @@ async function startServer() {
       // still-running pipeline (via the same stop_requested flag the Stop
       // button uses) to wind down instead of continuing to burn attempts
       // for a request the client has already given up on.
-      const GENERATE_TIMEOUT_MS = 600000; // 240s
+      const GENERATE_TIMEOUT_MS = 900000; //  
       const timeoutPromise = new Promise<never>((_, reject) => {
         setTimeout(() => {
           reject(new Error(`TIMEOUT: Generation exceeded ${GENERATE_TIMEOUT_MS / 1000}s server-side budget.`));
