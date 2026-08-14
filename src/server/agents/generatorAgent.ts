@@ -1,8 +1,75 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import getLangfuse from '../langfuse';
+
+// Batch runs execute multiple runGeneratorAgent() calls concurrently in the
+// SAME process (see BATCH_GENERATION_CONCURRENCY in pipeline.ts) — a plain
+// module-level "current tag" variable would get overwritten across workers
+// and every concurrent call would log the wrong tag. AsyncLocalStorage keeps
+// the tag correctly scoped to each call's own async context instead.
+const logTagStorage = new AsyncLocalStorage<string>();
+
+function logPrefix(): string {
+  const tag = logTagStorage.getStore();
+  return tag ? `[${tag}] ` : '';
+}
+
+// Records a real Langfuse "generation" entry (with token usage) for one
+// completed Claude API call. Without this, generatorAgent.ts only ever
+// created a single top-level trace() per question with no generation
+// events attached — Langfuse had no token counts to compute cost from, so
+// every Claude call showed 0 cost / didn't show up as a generation at all
+// (unlike validatorAgent.ts, which already does this correctly for its
+// Gemini calls). `trace` is optional so callers that don't have one
+// (or Langfuse itself misbehaving) never break actual generation.
+function logClaudeGenerationToLangfuse(params: {
+  trace?: any;
+  name: string;
+  systemPrompt: string;
+  userPrompt: string;
+  response: Anthropic.Message;
+}): void {
+  if (!params.trace) return;
+  try {
+    const generation = params.trace.generation({
+      name: params.name,
+      model: GENERATOR_MODEL,
+      input: [
+        { role: 'system', content: params.systemPrompt },
+        { role: 'user', content: params.userPrompt },
+      ],
+    });
+    const usage = (params.response as any)?.usage || {};
+    generation.end({
+      output: params.response,
+      usageDetails: {
+        input: usage.input_tokens ?? 0,
+        output: usage.output_tokens ?? 0,
+        cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+        cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+      },
+    });
+  } catch (e) {
+    // Never let observability logging break real question generation.
+    console.warn(`${logPrefix()}[Generator] Langfuse generation logging failed (non-fatal):`, e);
+  }
+}
 
 import { Question, PipelineStepLog, AnswerChoice } from '../../types';
 import { retrieveExemplarQuestionsForGeneration, JSONQuestion } from '../rag/ragSystem';
+import { evaluate } from 'mathjs';
+
+function isMathEquivalent(a: string, b: string): boolean {
+  if (a.trim() === b.trim()) return true;
+  try {
+    const valA = evaluate(a);
+    const valB = evaluate(b);
+    if (typeof valA === 'number' && typeof valB === 'number' && !isNaN(valA) && !isNaN(valB)) {
+      return Math.abs(valA - valB) < 0.0001;
+    }
+  } catch { /* not a simple scalar expression */ }
+  return false;
+}
 
 let aiClient: Anthropic | null = null;
 
@@ -60,7 +127,7 @@ async function generateContentWithRetry(params: {
   const ai = getAI();
 
   try {
-    console.log(`[Generator] Calling model: ${GENERATOR_MODEL}`);
+    console.log(`${logPrefix()}[Generator] Calling model: ${GENERATOR_MODEL}`);
 
     // `timeout` is passed as a per-request option (2nd arg), same role as the
     // AbortController wrapper this replaces — the SDK aborts the underlying
@@ -302,7 +369,7 @@ function extractJSON(raw: string): string {
 }
 
 // Generic JSON execution helper using Claude API
-async function callClaudeJSON<T>(systemPrompt: string, userPrompt: string, temperature = 0.2): Promise<T> {
+async function callClaudeJSON<T>(systemPrompt: string, userPrompt: string, temperature = 0.2, trace?: any, name = 'generate-json'): Promise<T> {
   const staticPrompt = userPrompt;
   const dynamicPrompt = "Respond with ONLY a single valid JSON object. Do not include markdown formatting, backticks, or wrapping other than the JSON itself.";
 
@@ -313,6 +380,8 @@ async function callClaudeJSON<T>(systemPrompt: string, userPrompt: string, tempe
     temperature,
     maxOutputTokens: 2048,
   });
+
+  logClaudeGenerationToLangfuse({ trace, name, systemPrompt, userPrompt, response });
 
   const rawText = Array.isArray(response?.content)
     ? response.content
@@ -342,59 +411,87 @@ async function callClaudeWithTool<T>(
   toolName: string,
   toolDescription: string,
   inputSchema: Anthropic.Tool.InputSchema,
-  temperature = 0.2
+  temperature = 0.2,
+  trace?: any
 ): Promise<T> {
   const ai = getAI();
 
-  try {
-    console.log(`[Generator] Calling model with tool '${toolName}': ${GENERATOR_MODEL}`);
-    // Same as generateContentWithRetry above — claude-sonnet-5 400s on any
-    // `temperature` value, so it's omitted here too.
-    const response = await ai.messages.create(
-      {
-        model: GENERATOR_MODEL,
-        max_tokens: 4096,
-        system: [
-          {
-            type: "text",
-            text: systemPrompt,
-            cache_control: { type: "ephemeral" },
-          },
-        ],
-        tools: [
-          {
-            name: toolName,
-            description: toolDescription,
-            input_schema: inputSchema,
-          },
-        ],
-        tool_choice: { type: "tool", name: toolName },
-        messages: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: userPrompt,
-                cache_control: { type: "ephemeral" },
-              },
-            ],
-          },
-        ],
-      },
-      { timeout: REQUEST_TIMEOUT_MS, maxRetries: 0 }
-    );
+  console.log(`${logPrefix()}[Generator] Calling model with tool '${toolName}': ${GENERATOR_MODEL}`);
+  // Same as generateContentWithRetry above — claude-sonnet-5 400s on any
+  // `temperature` value, so it's omitted here too.
+  //
+  // IMPORTANT: this call is intentionally NOT wrapped in a try/catch that
+  // falls back to callClaudeJSON. It used to be — ANY error here (a 429
+  // rate-limit, a 5xx, a timeout, an auth failure) silently triggered a
+  // SECOND Claude API call (the text-JSON fallback) with zero delay. Under
+  // rate-limiting that's the worst possible response: it doubles the
+  // request rate at exactly the moment the API is asking you to slow down,
+  // which is what was burning through quota so fast. Real errors now
+  // propagate up to runOrchestrationPipeline's attempt loop, which is the
+  // single place that decides whether/how to retry (see the backoff added
+  // there). The text-JSON fallback below is reserved ONLY for the case
+  // where the call actually succeeded but the model didn't return a
+  // tool_use block — a real (if rare, since tool_choice forces it)
+  // "model didn't cooperate" case, not a network/rate-limit case.
+  const response = await ai.messages.create(
+    {
+      model: GENERATOR_MODEL,
+      max_tokens: 4096,
+      system: [
+        {
+          type: "text",
+          text: systemPrompt,
+          cache_control: { type: "ephemeral" },
+        },
+      ],
+      tools: [
+        {
+          name: toolName,
+          description: toolDescription,
+          input_schema: inputSchema,
+        },
+      ],
+      tool_choice: { type: "tool", name: toolName },
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text: userPrompt,
+              cache_control: { type: "ephemeral" },
+            },
+          ],
+        },
+      ],
+    },
+    { timeout: REQUEST_TIMEOUT_MS, maxRetries: 0 }
+  );
 
-    const toolUseBlock = response.content.find((b: any) => b.type === "tool_use");
-    if (toolUseBlock && "input" in toolUseBlock) {
-      return toolUseBlock.input as T;
-    }
-  } catch (err: any) {
-    console.warn(`[Generator] Tool calling failed (${err?.message || err}). Falling back to text JSON parser.`);
+  // If the model hit the max_tokens cap mid-way through generating the
+  // tool call, response.content still contains a tool_use block — but its
+  // `input` can be a truncated/partial object (a field cut off mid-string,
+  // or missing entirely). Nothing downstream ever checked this, so a
+  // truncated question_text like "A rental company charges" (no question
+  // asked, no punctuation) sailed straight through checkQuestionCompleteness
+  // (which only checked for empty string) and even past the validator.
+  // Treat max_tokens as a failure and let the pipeline's normal retry path
+  // handle it, instead of silently using partial content.
+  if (response.stop_reason === "max_tokens") {
+    throw new Error(
+      `[Generator] Claude call for '${toolName}' was truncated (stop_reason=max_tokens, max_tokens=4096) — the tool input is likely incomplete. Retrying instead of using partial content.`
+    );
   }
 
-  // Fallback to text parsing if tool call was omitted
-  return callClaudeJSON<T>(systemPrompt, userPrompt, temperature);
+  const toolUseBlock = response.content.find((b: any) => b.type === "tool_use");
+  if (toolUseBlock && "input" in toolUseBlock) {
+    logClaudeGenerationToLangfuse({ trace, name: toolName, systemPrompt, userPrompt, response });
+    return toolUseBlock.input as T;
+  }
+
+  logClaudeGenerationToLangfuse({ trace, name: `${toolName}-no-tool-use`, systemPrompt, userPrompt, response });
+  console.warn(`[Generator] Model call for '${toolName}' succeeded but returned no tool_use block. Falling back to text JSON parser.`);
+  return callClaudeJSON<T>(systemPrompt, userPrompt, temperature, trace, `${toolName}-fallback`);
 }
 
 // Schemas for tool calling enforcement
@@ -501,6 +598,53 @@ const DIVERSE_ACADEMIC_TOPICS = [
   "Genomics & Comparative Epigenetic Adaptation in Alpine Species"
 ];
 
+// Domain-specific techniques rotated per-generation for mathematical variety
+const MATH_CONSTRUCTION_TECHNIQUES_NONLINEAR = [
+  "factoring out a common monomial before cancellation",
+  "difference of squares",
+  "difference/sum of cubes",
+  "grouping (factor by pairs)",
+  "completing the square",
+  "a quadratic-in-disguise substitution (e.g. u = x^2)",
+  "polynomial long division leaving a clean remainder",
+  "multiplying numerator and denominator by a conjugate",
+  "combining like terms after distributing a negative sign",
+  "cross-multiplying a proportion to clear denominators",
+];
+
+const MATH_CONSTRUCTION_TECHNIQUES_LINEAR = [
+  "two-variable linear system with real-world rate constraints",
+  "standard form Ax + By = C with integer intercepts",
+  "slope-intercept form from two coordinate pairs",
+  "linear equation with fractional coefficients cleared by LCD",
+  "parallel or perpendicular line slope relationship",
+  "linear function modeling a fixed fee plus variable rate",
+];
+
+const MATH_CONSTRUCTION_TECHNIQUES_GEOMETRY = [
+  "circle equation (x - h)^2 + (y - k)^2 = r^2 with completing the square",
+  "similar triangles with proportional side ratios",
+  "right triangle with standard Pythagorean triple (e.g., 3-4-5, 5-12-13, 8-15-17)",
+  "sector area or arc length with radian/degree measure",
+  "parallel lines cut by a transversal with alternate interior angles",
+];
+
+const MATH_CONSTRUCTION_TECHNIQUES_DATA = [
+  "two-way frequency table conditional probability or ratio",
+  "exponential growth or decay model with percentage rate",
+  "weighted average / mean calculation from grouped data",
+  "linear regression line of best fit slope interpretation",
+  "margin of error and sample size relationship",
+];
+
+function hashString(s: string): number {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
 // Stage 1: Draft the question context and statement only (no options or keys)
 async function generateScenarioDraft(params: {
   subject: string;
@@ -512,7 +656,7 @@ async function generateScenarioDraft(params: {
   feedback?: string;
   examType: string;
   topicSeed?: string;
-}, exemplarContext: string): Promise<ScenarioDraft> {
+}, exemplarContext: string, trace?: any): Promise<ScenarioDraft> {
   const isEnglish = params.subject.toLowerCase().includes('reading') || params.subject.toLowerCase().includes('writing') || params.subject.toLowerCase().includes('english');
   const chosenTopic = params.topicSeed || DIVERSE_ACADEMIC_TOPICS[Math.floor(Math.random() * DIVERSE_ACADEMIC_TOPICS.length)];
 
@@ -528,12 +672,71 @@ STRICT READING & WRITING QUALITY RULES:
 8. CRITICAL: DO NOT INCLUDE CHOICES IN QUESTION_TEXT: Under NO circumstances list answer options (A, B, C, D) inside "question_text".
 ` : '';
 
+  // Math never had an equivalent rule set — only English did. This is the
+  // primary reason Math questions were escalating far more than English:
+  // the zero-tolerance "correctness" and "difficulty_alignment" checks
+  // depend entirely on the SCENARIO drafted here being internally
+  // consistent (one defensible answer, all values stated, clean numbers,
+  // a solvable/consistent system) — a flaw introduced at this stage can't
+  // be fixed by the solver or distractor stages downstream, it just
+  // propagates into a failed validation (or a local mathSanityCheck
+  // mismatch) and forces a full extra attempt. These 8 rules target
+  // exactly those failure modes.
+  const mathQualityRules = (params.subject === 'Math') ? `
+STRICT MATH INTERNAL-CONSISTENCY & RIGOR RULES (violating these is the #1 cause of rejection/escalation — follow exactly):
+1. Single Defensible Answer: Before finalizing, mentally solve the problem yourself using ONLY the values/relationships stated in "stimulus"/"question_text". There must be exactly ONE numeric/algebraic answer under normal real-number, principal-value conventions. If your own solve produces an extraneous root, an undefined case, or more than one valid answer, change the numbers/setup until there is exactly one.
+2. All Given Values Explicit: Every number, variable, and relationship needed to solve the problem must be explicitly stated in "stimulus"/"question_text". Never require the solver to assume an unstated value.
+3. UNIVERSAL BACKWARD CONSTRUCTION FOR HARD MATH:
+   - For Systems of Equations: Choose the clean integer solution first (e.g., x = 4, y = -1), then construct two linear equations that intersect at that exact point.
+   - For Quadratics / Polynomials: Choose the clean roots or vertex first (e.g., roots x = 2, x = -5), then expand a(x-2)(x+5) to form the polynomial.
+   - For Rational Expressions & Identities: Choose the target simplified form first, then multiply numerator and denominator by common factors.
+   - For Geometry & Trigonometry: Use standard Pythagorean triples (3-4-5, 5-12-13, 8-15-17) or standard special angles (30°, 45°, 60°) to guarantee clean integer/fractional values.
+4. Clean Numbers by Default: The final answer and all intermediate values should be clean (whole numbers, simple fractions, or terminating decimals to at most 2 places) UNLESS the skill specifically calls for approximation — in which case explicitly instruct "round to the nearest ___" in the question_text.
+5. No Padding Complexity: Do not add extra variables, steps, or unusual notation just to look harder — difficulty must come from the reasoning/insight required (see the difficulty definition below), never from arithmetic grind.
+6. Consistent Systems: For any system of equations/relationships, verify by hand that it has exactly one consistent solution (not zero, not infinite) before finalizing — unless "no solution"/"infinite solutions" is itself the skill being tested.
+7. Match the Stated Difficulty Exactly: Re-read the difficulty definition below and ensure the REASONING DEPTH, not just the topic, matches it — an Easy question must be solvable in one direct step; do not disguise a Medium/Hard concept as Easy, or pad an Easy concept into fake Hard complexity.
+8. Geometry/Graphs: State all given measurements, angles, or coordinates numerically and explicitly in the text — never rely on a figure "looking a certain way" or an unstated visual assumption.
+9. Identities/Equivalent-Expressions — BUILD BACKWARDS, NEVER FORWARDS: For any question asking to identify an equivalent form, complete an identity, or find constants that make two expressions equal (e.g. "(6x²+x-12)/(2x²-9x+10) is equivalent to (3x+a)/(x+b) for what value of a+b?"), you MUST construct it by starting from the TARGET simplified form, picking its constants first, then multiplying/expanding OUTWARD to build the original complex expression — so the identity is true by construction.
+10. Strict Linearity / Degree Adherence: If the skill is "Linear equations" (in one or two variables), all equations MUST be strictly degree 1 (e.g., Ax + By = C or y = mx + b). NEVER introduce degree-2, degree-4, or substitution polynomials (like u = x^2) into linear equation items.
+` : '';
+
+
+  // Pure symbolic-manipulation math skills (identities, equivalent
+  // expressions, factoring) have no real-world "topic" to vary — the thing
+  // that actually needs to vary across attempts is the ALGEBRAIC
+  // CONSTRUCTION TECHNIQUE used, or every regeneration converges on the
+  // same handful of templates (this is what caused two consecutive
+  // similarity-check failures, one scoring a near-exact 1.0, against the
+  // very same skill). Rotated the same way DIVERSE_ACADEMIC_TOPICS is for
+  // real-world scenario framing.
+  const domainLower = (params.domain || '').toLowerCase();
+  const skillLower = (params.skill || '').toLowerCase();
+
+  let techniquesList = MATH_CONSTRUCTION_TECHNIQUES_NONLINEAR;
+  if (domainLower.includes('algebra') || skillLower.includes('linear')) {
+    techniquesList = MATH_CONSTRUCTION_TECHNIQUES_LINEAR;
+  } else if (domainLower.includes('geometry') || domainLower.includes('trigonometry') || skillLower.includes('circle') || skillLower.includes('triangle') || skillLower.includes('angle')) {
+    techniquesList = MATH_CONSTRUCTION_TECHNIQUES_GEOMETRY;
+  } else if (domainLower.includes('problem-solving') || domainLower.includes('data') || skillLower.includes('ratio') || skillLower.includes('probability') || skillLower.includes('stat')) {
+    techniquesList = MATH_CONSTRUCTION_TECHNIQUES_DATA;
+  }
+
+  const mathTechniqueSeed = techniquesList[
+    Math.abs(hashString(`${params.skill}:${Date.now()}:${Math.random()}`)) % techniquesList.length
+  ];
+  const mathDiversitySection = (params.subject === 'Math')
+    ? `\nSTRUCTURAL VARIETY: For this attempt, base the underlying mathematical construction on: ${mathTechniqueSeed}. (This only dictates the TECHNIQUE/structure used to build the expression — the actual numbers/constants must still be freshly chosen, not copied from any example.)\n`
+    : '';
+
   const systemPrompt = `You are an expert ${params.examType} ${params.subject === 'Math' ? 'Math' : 'English/Reading'} question scenario writer.
 You must call the 'create_scenario_draft' tool.
-${englishQualityRules}`;
+${englishQualityRules}${mathQualityRules}`;
 
+  const isMathRetry = params.subject === 'Math' && params.feedback;
   const feedbackSection = params.feedback
-    ? `\nCRITICAL FEEDBACK from previous attempt: "${params.feedback}". You MUST resolve this and avoid repeating this exact issue.\n`
+    ? isMathRetry
+      ? `\nCRITICAL RETRY INSTRUCTION: The previous attempt failed verification with feedback: "${params.feedback}". RETAIN the general narrative scenario/context from before if appropriate, and surgically fix the mathematical equations, constants, and derivation so they balance cleanly with exact integer/fractional solutions.\n`
+      : `\nCRITICAL FEEDBACK from previous attempt: "${params.feedback}". You MUST resolve this and avoid repeating this exact issue.\n`
     : '';
 
   const difficultyLine = params.difficultyDefinition
@@ -550,14 +753,40 @@ ${exemplarContext}
 INSTRUCTION: Match the exact sophistication, vocabulary density, sentence syntax, and mathematical complexity of the exemplars above. Do NOT copy the topic, but match the exact intellectual caliber.\n`
     : '';
 
+  const universalNoEmbeddedChoicesRule = `
+CRITICAL — NEVER EMBED ANSWER CHOICES IN THE QUESTION ITSELF: "question_text" and "stimulus" must NEVER
+list, enumerate, or spell out the answer options (no "A) ...", "B) ...", labeled candidate
+equations/values, or an inline list of choices anywhere in them). The four answer choices are
+generated and displayed SEPARATELY by a later stage — if you also write them into
+question_text/stimulus, the student will see every option twice. This applies even to question
+types that conventionally present multiple candidate values/equations/statements (e.g. "which of
+the following equations represents...", "which choice completes the text...") — phrase the
+question so it stands alone WITHOUT listing the candidates (e.g. "Which equation represents the
+line shown?" rather than "Which of the following — A) y=2x+1 B) y=3x+1... — represents the line
+shown?"). The actual candidate values belong only in the separate answer-choices step, never here.
+`;
+
+  // Applies to EVERY subject, not just English — this seed exists so
+  // successive generations (English passages AND Math word problems alike)
+  // don't all reach for the same handful of default contexts. Pure
+  // symbolic-algebra skills (identities, factoring) have no natural
+  // real-world framing, so the wording makes it optional for those rather
+  // than excluding Math from it entirely — it still applies to the large
+  // share of Math domains (Problem-Solving & Data Analysis, applied Algebra
+  // word problems, etc.) that DO use real-world scenarios.
+  const topicLine = `- Suggested real-world topic/context angle: ${chosenTopic}. ${isEnglish
+    ? 'Use this to frame the passage/stimulus.'
+    : 'Use this to frame the scenario if the skill involves a real-world word problem (most Algebra/Problem-Solving/Data-Analysis questions do); for a purely symbolic/algebraic-identity question with no natural real-world framing, you may stay abstract instead — do not force an awkward fit.'
+    }\n`;
+
   const userPrompt = `Generate a new original high-rigor ${params.examType} ${params.subject} question draft.
 ${feedbackSection}
 Specifications:
 - Domain: ${params.domain}
 - Skill: ${params.skill}
 ${difficultyLine}
-${params.studentLevel ? `- Student Level: ${params.studentLevel}` : ''}
-${graphSection}${exemplarHeader}`;
+${topicLine}${params.studentLevel ? `- Student Level: ${params.studentLevel}` : ''}
+${graphSection}${mathDiversitySection}${universalNoEmbeddedChoicesRule}${exemplarHeader}`;
 
   return await callClaudeWithTool<ScenarioDraft>(
     systemPrompt,
@@ -565,12 +794,13 @@ ${graphSection}${exemplarHeader}`;
     "create_scenario_draft",
     "Creates a formal SAT question scenario draft with passage_intro, passage, stimulus, and question_text",
     SCENARIO_DRAFT_SCHEMA,
-    0.6
+    0.6,
+    trace
   );
 }
 
 // Stage 2: Solve the scenario step-by-step
-async function solveScenario(draft: ScenarioDraft, params: { subject: string; examType: string }): Promise<SolvedScenario> {
+async function solveScenario(draft: ScenarioDraft, params: { subject: string; examType: string }, trace?: any): Promise<SolvedScenario> {
   const systemPrompt = `You are a strict, chief exam mathematical and textual solver.
 Your task is to independently solve the question step-by-step and calculate the exact mathematical or textual answer.
 You must call the 'solve_scenario' tool.`;
@@ -578,15 +808,20 @@ You must call the 'solve_scenario' tool.`;
   const userPrompt = `Solve the following exam question:
 ${draft.passage ? `Passage: ${draft.passage}\n` : ''}${draft.stimulus ? `Stimulus: ${draft.stimulus}\n` : ''}Question: ${draft.question_text}
 
-Calculate the exact final numerical, fractional, or text-completion answer. Double check your arithmetic.
+Calculate the exact final numerical, fractional, or text-completion answer.
+${params.subject === 'Math' ? `MANDATORY STEP-BY-STEP VERIFICATION:
+1. Show each algebraic transformation explicitly in "step_by_step_solution".
+2. Substitute the final computed value back into the original problem statement/equations to prove both sides balance.
+3. If the computed value does not yield exact equality, discard and re-solve before outputting "exact_computed_answer".
+Do not submit an answer you have not verified this way.` : 'Double check your reasoning against the passage text before finalizing.'}
 For math: if the result is a fraction, write it in simplified form (e.g. '10/3') or decimal (e.g. '1.5').
 
 CRITICAL FORMATTING RULE for "exact_computed_answer": output ONLY the raw value itself
 (e.g. 'y = 2.5x + 5' or '3/4' or '12'). NEVER prefix it with an answer-choice letter or
-label, even if the question presents candidate equations/options as A/B/C/D — this field
-is compared programmatically against the answer choices and any leading "A) ", "B) ",
-"Option C:", etc. will corrupt that mapping. Put any such reasoning about which lettered
-option matches inside "step_by_step_solution" instead, never inside "exact_computed_answer".
+label (e.g. "A) ", "B) ", "Option C:") — this field is compared programmatically against
+the answer choices and any such prefix will corrupt that mapping. If the draft's stimulus
+happens to reference lettered options (it shouldn't — flag this in step_by_step_solution if
+so), still report only the raw solved value here, never a letter/label.
 
 ${params.subject === 'Math' ? `If this question reduces to one clean, calculator-checkable equation, also fill in
 "verification" with that equation (equation_lhs, equation_rhs, variable, variable_value) so
@@ -605,7 +840,8 @@ checkable equation.` : ''}`;
     "solve_scenario",
     "Solves the exam scenario step-by-step and computes exact answer",
     SOLVED_SCENARIO_SCHEMA,
-    0.1
+    0.0,
+    trace
   );
 }
 
@@ -613,16 +849,18 @@ checkable equation.` : ''}`;
 async function generateWrongChoices(
   draft: ScenarioDraft,
   solved: SolvedScenario,
-  params: { subject: string; examType: string; difficulty?: string }
+  params: { subject: string; examType: string; difficulty?: string },
+  trace?: any
 ): Promise<WrongChoices> {
   const systemPrompt = `You are an expert exam distractor options creator.
 Your goal is to generate exactly 3 plausible wrong options calibrated strictly to the requested difficulty level (${params.difficulty || 'Medium'}).
 You must call the 'generate_wrong_choices' tool.`;
 
   const mathGuidelines = `Strict Distractor Guidelines (Math):
-1. Intermediate Step Trap (Half-Right): The value of an intermediate variable solved along the way (e.g., solving for x instead of the requested expression, or reporting x-intercept instead of y-intercept).
-2. Conceptual Misconception: Applying an incorrect rule (e.g., setting the sum of angles to 360 instead of 180, multiplying instead of dividing, or using opposite operations).
-3. Arithmetic / Sign Trap: The result of a minor calculation slip or sign flip (+/-).`;
+1. Intermediate Step Trap (Half-Right): Solve for an intermediate variable along the way (e.g., solving for x instead of the requested expression 2x+1, or reporting the x-intercept instead of the y-intercept).
+2. Conceptual Misconception: Apply a common student error (e.g., setting the sum of angles to 360 instead of 180, using diameter instead of radius, or adding exponents during addition).
+3. Arithmetic / Sign Trap: The result of a single calculation slip or sign flip (+/-) from the real derivation.
+4. MANDATORY CHECK — No Secondary-Correct Answers: Before finalizing each distractor, verify it does NOT also satisfy the original question under any reasonable reading (e.g. it isn't an unstated root, a rounding/formatting variant, or an equivalent expression). Every distractor must be genuinely wrong.`;
 
   const englishGuidelines = `Strict Distractor Guidelines (English/Reading - Calibrated to ${params.difficulty || 'Medium'} difficulty):
 - EASY DIFFICULTY: 1 clearly incorrect choice, 2 plausible choices that are slightly off-topic or misinterpret clear passage facts.
@@ -656,7 +894,8 @@ afterward, so any embedded letter prefix will corrupt the final answer key.`;
     "generate_wrong_choices",
     "Generates 3 calibrated distractor choices with student error rationales",
     WRONG_CHOICES_SCHEMA,
-    0.5
+    0.5,
+    trace
   );
 }
 
@@ -704,7 +943,7 @@ function assembleChoices(
 
   // Deduplicate and filter out correct answer from distractors in case LLM slipped
   const uniqueDistractors: string[] = Array.from(new Set(rawDistractors))
-    .filter(d => d !== computedAnswer)
+    .filter(d => !isMathEquivalent(d, computedAnswer))
     .slice(0, 3);
 
   // If we don't have enough distractors, fill in plausible placeholders
@@ -712,9 +951,20 @@ function assembleChoices(
     const backupVal = parseFloat(computedAnswer);
     if (!isNaN(backupVal)) {
       const offset = (uniqueDistractors.length + 1) * (backupVal > 10 ? 5 : 1);
-      uniqueDistractors.push(String(backupVal + offset));
+      const candidate = String(backupVal + offset);
+      if (!uniqueDistractors.includes(candidate)) {
+        uniqueDistractors.push(candidate);
+      } else {
+        uniqueDistractors.push(String(backupVal - offset));
+      }
+    } else if (computedAnswer.includes('=')) {
+      // Equation distractor variant (flip sign or adjust constant)
+      const modified = computedAnswer.replace(/([+-])\s*(\d+)/, (_, sign, num) =>
+        `${sign === '+' ? '-' : '+'} ${parseInt(num, 10) + uniqueDistractors.length + 1}`
+      );
+      uniqueDistractors.push(modified !== computedAnswer && !uniqueDistractors.includes(modified) ? modified : `${computedAnswer} + ${uniqueDistractors.length + 1}`);
     } else {
-      uniqueDistractors.push(`Option ${uniqueDistractors.length + 2}`);
+      uniqueDistractors.push(`${computedAnswer} (alternate ${uniqueDistractors.length + 1})`);
     }
   }
 
@@ -815,19 +1065,19 @@ async function generateChunk(params: {
   // 1. Parallel Stage 1: Drafting
   const draftPromises = Array.from({ length: chunkSize }, (_, idx) => {
     const topicSeed = DIVERSE_ACADEMIC_TOPICS[(timestamp + idx) % DIVERSE_ACADEMIC_TOPICS.length];
-    return generateScenarioDraft({ ...params, topicSeed }, exemplarContext);
+    return generateScenarioDraft({ ...params, topicSeed }, exemplarContext, trace);
   });
   const drafts = await Promise.all(draftPromises);
 
   // 2. Parallel Stage 2: Solving
   const solvePromises = drafts.map(draft =>
-    solveScenario(draft, params)
+    solveScenario(draft, params, trace)
   );
   const solvedList = await Promise.all(solvePromises);
 
   // 3. Parallel Stage 3: Distractors
   const wrongPromises = drafts.map((draft, idx) =>
-    generateWrongChoices(draft, solvedList[idx], params)
+    generateWrongChoices(draft, solvedList[idx], params, trace)
   );
   const wrongList = await Promise.all(wrongPromises);
 
@@ -854,8 +1104,36 @@ export async function runGeneratorAgent(params: {
   feedback?: string;
   count?: number;       // total questions wanted, default 50
   chunkSize?: number;    // questions per Claude call, default 10
+  logTag?: string;       // question_id (or similar) to prefix console logs with, so concurrent batch workers are distinguishable in the log stream
 }): Promise<{ questions: Question[] }> {
 
+  const {
+    subject, domain, skill, difficulty, difficultyDefinition, attempt = 1, onStep, feedback,
+    examType = 'SAT',
+    count = 1,
+    chunkSize = 1,
+    studentLevel,
+    logTag,
+  } = params;
+
+  return logTagStorage.run(logTag || '', () => runGeneratorAgentInner(params));
+}
+
+async function runGeneratorAgentInner(params: {
+  subject: string;
+  domain: string;
+  skill: string;
+  difficulty: string;
+  difficultyDefinition?: string;
+  studentLevel?: string;
+  examType?: string;
+  attempt?: number;
+  onStep?: (log: PipelineStepLog) => void | Promise<void>;
+  feedback?: string;
+  count?: number;
+  chunkSize?: number;
+  logTag?: string;
+}): Promise<{ questions: Question[] }> {
   const {
     subject, domain, skill, difficulty, difficultyDefinition, attempt = 1, onStep, feedback,
     examType = 'SAT',

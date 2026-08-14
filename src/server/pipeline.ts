@@ -37,6 +37,29 @@ export function checkQuestionCompleteness(q: Question): { complete: boolean; rea
   if (!q.question_text || !q.question_text.trim()) {
     return { complete: false, reason: "Question text is missing." };
   }
+  // Catches truncated generations (e.g. the model hit max_tokens mid-way
+  // through the tool call, leaving a partial question_text like "A rental
+  // company charges" — nonempty, so the check above missed it entirely,
+  // but not an actual complete question). A real question prompt either
+  // ends with a question mark, ends with a colon / contains a blank (the
+  // English fill-in-the-blank style), or contains a recognizable
+  // question/instruction phrase. Anything that matches none of those AND
+  // is suspiciously short is almost certainly truncated, not just terse.
+  const qt = q.question_text.trim();
+  const looksLikeACompleteQuestion =
+    /[?]\s*$/.test(qt) ||
+    /:\s*$/.test(qt) ||
+    /___/.test(qt) ||
+    /\b(which of the following|what is|what value|what are|find|determine|calculate|solve for|complete the|select the|identify the|how many|how much)\b/i.test(qt);
+  const wordCount = qt.split(/\s+/).filter(Boolean).length;
+  // Allow concise question stems (>= 3 words) if a recognizable question trigger is present
+  const minWords = looksLikeACompleteQuestion ? 3 : 6;
+  if (!looksLikeACompleteQuestion || wordCount < minWords) {
+    return {
+      complete: false,
+      reason: `Question text looks truncated/incomplete (${wordCount} words, no question mark/colon/recognizable question phrase): "${qt.slice(0, 80)}${qt.length > 80 ? "..." : ""}"`,
+    };
+  }
   if (!Array.isArray(q.answer_choices) || q.answer_choices.length < 2) {
     return { complete: false, reason: "Fewer than 2 answer choices were produced." };
   }
@@ -93,7 +116,7 @@ export async function runSimilarityCheck(
   examType: string,
   userId?: string
 ): Promise<{ similarity_score: number; similar_question_id: string | null; embedding?: number[] }> {
-  const existingQuestions = await Database.getQuestions({ exam_type: examType, includeEmbeddings: true });
+  const existingQuestions = await Database.getQuestions({ exam_type: examType, status: "approved", includeEmbeddings: true });
   if (existingQuestions.length === 0) {
     return { similarity_score: 0, similar_question_id: null };
   }
@@ -770,6 +793,29 @@ function getSimulatedQuestion(
 // ----------------------------------------------------
 // Orchestrator: Loop, Retry, Escalation (Exam-Agnostic)
 // ----------------------------------------------------
+// Used to decide how long to back off before the pipeline's next attempt
+// after a real Claude API failure. Without this, a 429/503/overload error
+// was immediately followed by another full attempt (another 3 sequential
+// Claude calls) with zero delay — which, under actual rate-limiting, just
+// re-triggers the same error faster and burns quota without giving the API
+// any room to recover. This mirrors the classification already used in
+// validatorAgent.ts for its own (Gemini) fallback chain.
+function isRateLimitOrOverloadError(err: any): boolean {
+  const status = err?.status ?? err?.error?.status ?? 0;
+  const msg = String(err?.message || err || "").toLowerCase();
+  return (
+    status === 429 || status === 503 || status === 529 ||
+    msg.includes("429") || msg.includes("503") || msg.includes("529") ||
+    msg.includes("rate limit") || msg.includes("rate_limit") ||
+    msg.includes("overloaded") || msg.includes("quota") ||
+    msg.includes("resource_exhausted")
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export async function runOrchestrationPipeline(params: {
   exam_type: string;
   section: string;
@@ -875,6 +921,10 @@ export async function runOrchestrationPipeline(params: {
 
     let draftQuestion: Question;
     let isSimulatedDraft = false;
+    // Only set when the real Claude call actually threw (vs. simulated mode
+    // being used because no API key is configured at all) — used below to
+    // decide whether/how long to back off before the next attempt.
+    let generatorFailureError: any = null;
     // Generation now runs on Claude, so gate real-vs-simulated on the Anthropic
     // key (the validator/embeddings still use GEMINI_API_KEY separately).
     const key = process.env.ANTHROPIC_API_KEY;
@@ -923,7 +973,8 @@ export async function runOrchestrationPipeline(params: {
           onStep: agentStepLogger,
           feedback: lastFeedback,
           count: 1,
-          chunkSize: 1
+          chunkSize: 1,
+          logTag: qId
         });
         if (!result.questions || result.questions.length === 0) {
           throw new Error("Generator Agent returned no questions.");
@@ -931,6 +982,7 @@ export async function runOrchestrationPipeline(params: {
         draftQuestion = result.questions[0];
       } catch (err: any) {
         isSimulatedDraft = true;
+        generatorFailureError = err;
         await agentStepLogger({
           timestamp: new Date().toISOString(),
           type: 'draft',
@@ -986,6 +1038,36 @@ export async function runOrchestrationPipeline(params: {
       await addLog("pre_filter", "Math & Choice Sanity Check: PASS — computed answer matches claimed correct_answer.");
     }
 
+    // A simulated-fallback draft must never be auto-approved into the live
+    // bank no matter what a downstream check says about it — it's a canned
+    // template, not a real generation. Short-circuit HERE, before the
+    // similarity check and validator (both real API calls) — previously
+    // this check ran only after both had already fired on content that was
+    // guaranteed to be discarded regardless of their result, wasting an
+    // embedding call + a validator call every single time the real Claude
+    // call failed.
+    if (isSimulatedDraft) {
+      await addLog("decision", `Attempt ${currentAttempt} used simulated-fallback content (real Claude call failed) — skipping similarity/validation (would be discarded regardless) and escalating for human review.`);
+      lastFeedback = "The previous attempt's real Claude call failed (rate limit/timeout/error) and fell back to a template placeholder. Please retry a real generation.";
+
+      // Back off before the next attempt IF this was caused by a real
+      // Claude API error (not just "no API key configured"). Previously
+      // this looped straight back into another 3-call attempt with zero
+      // delay — under real rate-limiting that just re-triggers the same
+      // 429 faster and burns quota without giving the API room to recover.
+      if (generatorFailureError) {
+        const rateLimited = isRateLimitOrOverloadError(generatorFailureError);
+        const backoffMs = rateLimited
+          ? Math.min(30000, 5000 * currentAttempt)   // 5s, 10s, 15s... capped at 30s
+          : Math.min(10000, 2000 * currentAttempt);  // 2s, 4s, 6s... capped at 10s for other transient errors
+        await addLog("decision", `Backing off ${Math.round(backoffMs / 1000)}s before next attempt (${rateLimited ? "rate-limit/overload" : "transient error"} detected on the real Claude call) to avoid hammering the API.`);
+        await sleep(backoffMs);
+      }
+
+      currentAttempt++;
+      continue;
+    }
+
     // Step 3: Similarity check (before validator)
     await addLog("pre_filter", "Running similarity check against question bank...");
     const simResult = await runSimilarityCheck(draftQuestion.question_text, draftQuestion.passage, exam_type);
@@ -994,14 +1076,16 @@ export async function runOrchestrationPipeline(params: {
     if (simResult.embedding) {
       draftQuestion.embedding = simResult.embedding;
     }
+    const similarityThreshold = section === "Math" ? 0.90 : 0.85;
 
-    if (simResult.similarity_score > 0.85 && !isSimulatedDraft) {
+
+    if (simResult.similarity_score > similarityThreshold) {
       await addLog("pre_filter", `Pre-Validation Warning: High similarity detected (${simResult.similarity_score}) with question ${simResult.similar_question_id}. Forcing regeneration.`);
-      lastFeedback = `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). You MUST generate a completely different question with a new scenario, different numbers, and different wording.`;
+      lastFeedback = section === "Math"
+        ? `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). Changing only the numbers is NOT enough — you MUST use a genuinely different underlying algebraic construction/technique this time (see the structural variety instruction), not just re-skin the same template with new constants.`
+        : `Your previous question was too similar to an existing question in the bank (similarity score: ${simResult.similarity_score}). You MUST generate a completely different question with a new scenario, different numbers, and different wording.`;
       currentAttempt++;
       continue;
-    } else if (simResult.similarity_score > 0.85 && isSimulatedDraft) {
-      await addLog("pre_filter", `Pre-Validation Info: High similarity (${simResult.similarity_score}) detected on simulated fallback template. Bypassing similarity block for simulated fallback mode.`);
     } else {
       await addLog("pre_filter", `Pre-Validation PASS: Originality check completed (similarity score ${simResult.similarity_score}).`);
     }
@@ -1060,20 +1144,6 @@ export async function runOrchestrationPipeline(params: {
 
     const finalCompleteness = checkQuestionCompleteness(draftQuestion);
 
-    // A simulated-fallback draft must never be auto-approved into the live
-    // bank, no matter what the validator says about it — the validator is
-    // scoring a canned template, not a real generation, so a "PASS" here
-    // says nothing about actual question quality. Force it straight to
-    // escalation so a human reviews it (or, more likely, re-triggers
-    // generation once the rate limit/outage clears) instead of it silently
-    // polluting the approved question bank.
-    if (isSimulatedDraft) {
-      await addLog("decision", `Attempt ${currentAttempt} used simulated-fallback content (real Claude call failed) — never auto-approved regardless of validator result. Escalating for human review.`);
-      lastFeedback = "The previous attempt's real Claude call failed (rate limit/timeout/error) and fell back to a template placeholder. Please retry a real generation.";
-      currentAttempt++;
-      continue;
-    }
-
     if (validationBlock.validation_status === "PASS" && finalCompleteness.complete) {
       draftQuestion.status = "approved";
       await Database.saveQuestion(draftQuestion);
@@ -1085,7 +1155,9 @@ export async function runOrchestrationPipeline(params: {
       return draftQuestion;
     } else {
       const failureReason = validationBlock.validation_status !== "PASS"
-        ? validationBlock.feedback
+        ? (validationBlock.revised_suggestion
+          ? `${validationBlock.feedback} SPECIFIC FIX REQUIRED: ${validationBlock.revised_suggestion}`
+          : validationBlock.feedback)
         : `Validator passed the question but it failed the completeness gate — ${finalCompleteness.reason}`;
       await addLog("decision", `Attempt ${currentAttempt} FAILED validation. Actionable feedback: "${failureReason}"`);
 

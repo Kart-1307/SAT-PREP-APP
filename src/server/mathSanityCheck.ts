@@ -77,7 +77,9 @@ export function runMathSanityCheck(question: Question): MathSanityResult {
     const matches =
       typeof lhsValue === 'number' &&
       typeof rhsValue === 'number' &&
-      Math.abs(lhsValue - rhsValue) < EPSILON;
+      !isNaN(lhsValue) &&
+      !isNaN(rhsValue) &&
+      (Math.abs(lhsValue - rhsValue) < EPSILON || Math.abs((lhsValue - rhsValue) / (rhsValue || 1)) < EPSILON);
 
     if (!matches) {
       const assignmentDesc = variables

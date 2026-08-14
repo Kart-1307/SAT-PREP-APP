@@ -80,7 +80,7 @@ async function generateContentWithRetry(params: {
             config: {
               systemInstruction: params.systemPrompt,
               responseMimeType: params.responseMimeType || "application/json",
-              temperature: params.temperature !== undefined ? params.temperature : 0.1,
+              temperature: params.temperature !== undefined ? params.temperature : 0.0,
               abortSignal: controller.signal,
             }
           });
@@ -393,11 +393,13 @@ export async function runValidatorAgent(params: {
     const systemPrompt = `You are an expert Exam Quality Validator Agent.
 You inspect the generated question for academic standards, mathematical accuracy, and distractor quality.
 
-CRITICAL INSTRUCTION FOR INDEPENDENT DERIVATION:
-Before looking at the correct answer or the explanation, you MUST independently solve the question step-by-step.
-If the question object includes a non-null "passage" or "stimulus" field, treat it as the SOLE authoritative source of context.
-Write down your step-by-step mathematical derivation or reading comprehension proof inside the "independent_derivation" field of the JSON.
-
+CRITICAL INSTRUCTION FOR MATHEMATICAL VALIDATION & INDEPENDENT DERIVATION:
+1. First, attempt to solve the question independently using only "stimulus" and "question_text". Write your derivation in "independent_derivation".
+2. DISCREPANCY RECONCILIATION:
+   - If your independent derivation matches the question's correct answer: score correctness 5/5.
+   - If your derivation differs from the question's answer: DO NOT immediately fail. Check the question's provided "step_by_step_solution" / "explanation":
+     a. If the question's derivation is mathematically sound and your own independent solve had a calculation slip, accept the question (score correctness 4-5/5).
+     b. If the question's derivation genuinely contains an algebraic/arithmetic error, mark correctness 0-2/5 and pinpoint the exact erroneous step in "feedback".
 Grading Scale:
 For each check below, rate the question on a scale of 0 to 5:
 - 5: Flawless / Fully satisfied (no issues).
@@ -429,14 +431,28 @@ You must output your response in JSON format matching this schema:
   "revised_suggestion": "string or null (concrete correction, hint, or formula update needed to pass)"
 }`;
 
+    // Previously the validator only ever saw the bare label
+    // (question.difficulty === "Hard") via the raw JSON dump below, with no
+    // actual rubric to score difficulty_alignment against — it was grading
+    // "does this feel Hard-ish" with zero criteria, which is exactly why a
+    // plug-into-a-system-of-equations question could get 5/5. The generator
+    // gets this same definition text (see difficultyLine in
+    // generatorAgent.ts); the validator needs it just as much.
+    const difficultyEntry = Array.isArray(config?.difficulty_scale)
+      ? config.difficulty_scale.find((d: any) => d.label === question.difficulty)
+      : null;
+    const difficultyNote = difficultyEntry?.definition
+      ? `\nDIFFICULTY RUBRIC FOR "${question.difficulty}" — score "difficulty_alignment" against THIS EXACT definition, not a general impression of the label:\n"${difficultyEntry.definition}"\n`
+      : '';
+
     const stimulusNote = question.passage
       ? `\nNOTE: This question has a "passage" field — it is the authoritative reading passage. Base your comprehension check on it directly.\n`
       : question.stimulus
-        ? `\nNOTE: This question has a "stimulus" field — it is the authoritative equation/function/table/context the question is based on: "${question.stimulus}". Re-derive the answer from THIS, not from question_text alone.\n`
+        ? `\nNOTE: This question has a "stimulus" field — it is the authoritative equation/function/table/context to DERIVE the answer from. But "question_text" is what the student actually reads — grade its clarity/completeness independently (see above).\n`
         : '';
 
     const prompt = `Please validate this generated question object:
-${stimulusNote}${JSON.stringify(question, null, 2)}`;
+${difficultyNote}${stimulusNote}${JSON.stringify(question, null, 2)}`;
 
     // Langfuse trace for this validation call — mirrors the generator
     // agent's tracing so token usage/cost show up for validation too, not
@@ -456,7 +472,7 @@ ${stimulusNote}${JSON.stringify(question, null, 2)}`;
     const generation = trace.generation({
       name: 'validate-question',
       model: VALIDATOR_MODEL,
-      modelParameters: { temperature: 0.1 },
+      modelParameters: { temperature: 0.0 },
       input: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: prompt },
@@ -469,7 +485,7 @@ ${stimulusNote}${JSON.stringify(question, null, 2)}`;
         prompt,
         systemPrompt,
         responseMimeType: "application/json",
-        temperature: 0.1
+        temperature: 0.0
       });
       res = result.res;
       // Record which model in the fallback chain actually served this call

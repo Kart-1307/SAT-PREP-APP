@@ -10,6 +10,7 @@ import { Database } from "./src/server/db";
 import { getDb } from "./src/server/mongoClient";
 import { runOrchestrationPipeline, createBatchRun, processBatchRun, buildAllCombinations } from "./src/server/pipeline";
 import { ensureCollections, getCollectionStats, MATH_COLLECTION_NAME, ENGLISH_COLLECTION_NAME } from './src/server/rag/qdrantClient';
+import getLangfuse from "./src/server/langfuse";
 
 // Connect (and build indexes) at boot instead of lazily on the first request —
 // previously the first /api/questions or /api/configs call after `npm run dev`
@@ -870,6 +871,23 @@ async function startServer() {
     const server = app.listen(port, "0.0.0.0", () => {
       console.log(`Server running on http://localhost:${port}`);
     });
+
+    // Langfuse batches trace/generation events client-side and relies on a
+    // periodic background timer to send them — nothing in this codebase
+    // ever called flushAsync/shutdown, so events from the last few seconds
+    // before a restart (exactly what happens every time this server is
+    // redeployed to pick up code changes) could be silently dropped.
+    const gracefulShutdown = async (signal: string) => {
+      console.log(`[Server] Received ${signal}, flushing Langfuse events before exit...`);
+      try {
+        await getLangfuse().shutdownAsync();
+      } catch (err) {
+        console.warn("[Server] Langfuse shutdown/flush failed (non-fatal):", err);
+      }
+      server.close(() => process.exit(0));
+    };
+    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
     server.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE" && port !== 0) {
