@@ -59,7 +59,7 @@ import { Question, PipelineStepLog, AnswerChoice } from '../../types';
 import { retrieveExemplarQuestionsForGeneration, JSONQuestion } from '../rag/ragSystem';
 import { evaluate } from 'mathjs';
 
-function isMathEquivalent(a: string, b: string): boolean {
+export function isMathEquivalent(a: string, b: string): boolean {
   if (a.trim() === b.trim()) return true;
   try {
     const valA = evaluate(a);
@@ -412,7 +412,8 @@ async function callClaudeWithTool<T>(
   toolDescription: string,
   inputSchema: Anthropic.Tool.InputSchema,
   temperature = 0.2,
-  trace?: any
+  trace?: any,
+  maxTokens = 8192
 ): Promise<T> {
   const ai = getAI();
 
@@ -436,7 +437,7 @@ async function callClaudeWithTool<T>(
   const response = await ai.messages.create(
     {
       model: GENERATOR_MODEL,
-      max_tokens: 4096,
+      max_tokens: maxTokens,
       system: [
         {
           type: "text",
@@ -479,7 +480,7 @@ async function callClaudeWithTool<T>(
   // handle it, instead of silently using partial content.
   if (response.stop_reason === "max_tokens") {
     throw new Error(
-      `[Generator] Claude call for '${toolName}' was truncated (stop_reason=max_tokens, max_tokens=4096) — the tool input is likely incomplete. Retrying instead of using partial content.`
+      `[Generator] Claude call for '${toolName}' was truncated (stop_reason=max_tokens, max_tokens=${maxTokens}) — the tool input is likely incomplete. Retrying instead of using partial content.`
     );
   }
 
@@ -841,7 +842,14 @@ checkable equation.` : ''}`;
     "Solves the exam scenario step-by-step and computes exact answer",
     SOLVED_SCENARIO_SCHEMA,
     0.0,
-    trace
+    trace,
+    // solve_scenario's output (step_by_step_solution + explanation +
+    // verification) is the most token-heavy of the three tool calls — this
+    // is the one that was hitting the old 4096-token cap mid-generation
+    // (see log: "Claude call for 'solve_scenario' was truncated"), burning
+    // a full pipeline attempt for free. Give it more headroom than the
+    // 8192 default the other two calls use implicitly.
+    12288
   );
 }
 
