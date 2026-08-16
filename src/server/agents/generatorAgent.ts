@@ -510,9 +510,18 @@ const SCENARIO_DRAFT_SCHEMA: Anthropic.Tool.InputSchema = {
 const SOLVED_SCENARIO_SCHEMA: Anthropic.Tool.InputSchema = {
   type: "object",
   properties: {
-    exact_computed_answer: { type: "string", description: "The exact final solved numerical or text value." },
-    step_by_step_solution: { type: "string", description: "Detailed step-by-step mathematical or textual derivation." },
-    explanation: { type: "string", description: "Student-friendly explanation of the correct logic." },
+    step_by_step_solution: { 
+      type: "string", 
+      description: "First solve the entire problem step-by-step showing all algebraic transformations explicitly and substituting the final root back in." 
+    },
+    exact_computed_answer: { 
+      type: "string", 
+      description: "The EXACT final numerical value reached on the very last line of your step_by_step_solution. Must match your derivation perfectly." 
+    },
+    explanation: { 
+      type: "string", 
+      description: "Student-friendly explanation of the correct logic." 
+    },
     verification: {
       type: ["object", "null"],
       description:
@@ -546,7 +555,7 @@ const SOLVED_SCENARIO_SCHEMA: Anthropic.Tool.InputSchema = {
       },
     },
   },
-  required: ["exact_computed_answer", "step_by_step_solution", "explanation"],
+  required: ["step_by_step_solution", "exact_computed_answer", "explanation"],
 };
 
 const WRONG_CHOICES_SCHEMA: Anthropic.Tool.InputSchema = {
@@ -646,6 +655,37 @@ function hashString(s: string): number {
   return h;
 }
 
+// ═══════════════════════════════════════════════════════════
+// DYNAMIC RANDOM TARGET GENERATOR (Zero LLM Number Bias)
+// ═══════════════════════════════════════════════════════════
+function generateRandomMathTarget(skill: string, difficulty: string): { variableName: string; targetValue: string; instruction: string } {
+  // Rotate variable names dynamically (never always 'x' or 'n')
+  const variables = ['x', 'y', 'n', 'k', 'm', 'p', 't', 'w', 'c', 'v'];
+  const varName = variables[Math.floor(Math.random() * variables.length)];
+
+  // Generate a random positive integer between 7 and 95
+  let randomInt = Math.floor(Math.random() * (95 - 7 + 1)) + 7;
+
+  // Shift away from round multiples of 10 (avoids 10, 20, 50, 100)
+  if (randomInt % 10 === 0) {
+    randomInt += (Math.random() > 0.5 ? 3 : -3);
+  }
+
+  // For Hard difficulty, 35% chance of generating a clean fraction (e.g. 15/2, 23/4, 47/5)
+  const isHard = (difficulty || '').toLowerCase().includes('hard');
+  let targetStr = String(randomInt);
+
+  if (isHard && Math.random() > 0.65) {
+    const denoms = [2, 4, 5];
+    const denom = denoms[Math.floor(Math.random() * denoms.length)];
+    const numer = randomInt * denom + (Math.floor(Math.random() * (denom - 1)) + 1);
+    targetStr = `${numer}/${denom}`;
+  }
+
+  const instruction = `REVERSE-CONSTRUCTION TARGET: Design the underlying algebraic/numerical relationship so that the target quantity evaluates cleanly to ${targetStr}. Use natural, diverse SAT question phrasing (e.g. "How many total items...", "What is the radius of...", "What was the speed in mph...", "What is the value of ${varName}?", etc.) matching the specific domain context.`
+  return { variableName: varName, targetValue: targetStr, instruction };
+}
+
 // Stage 1: Draft the question context and statement only (no options or keys)
 async function generateScenarioDraft(params: {
   subject: string;
@@ -660,6 +700,10 @@ async function generateScenarioDraft(params: {
 }, exemplarContext: string, trace?: any): Promise<ScenarioDraft> {
   const isEnglish = params.subject.toLowerCase().includes('reading') || params.subject.toLowerCase().includes('writing') || params.subject.toLowerCase().includes('english');
   const chosenTopic = params.topicSeed || DIVERSE_ACADEMIC_TOPICS[Math.floor(Math.random() * DIVERSE_ACADEMIC_TOPICS.length)];
+
+  // 🎲 Generate fresh random target number & variable for Math
+  const mathTarget = (!isEnglish) ? generateRandomMathTarget(params.skill, params.difficulty) : null;
+  const mathTargetSection = mathTarget ? `\n${mathTarget.instruction}\n` : '';
 
   const englishQualityRules = isEnglish ? `
 STRICT READING & WRITING QUALITY RULES:
@@ -699,6 +743,9 @@ STRICT MATH INTERNAL-CONSISTENCY & RIGOR RULES (violating these is the #1 cause 
 8. Geometry/Graphs: State all given measurements, angles, or coordinates numerically and explicitly in the text — never rely on a figure "looking a certain way" or an unstated visual assumption.
 9. Identities/Equivalent-Expressions — BUILD BACKWARDS, NEVER FORWARDS: For any question asking to identify an equivalent form, complete an identity, or find constants that make two expressions equal (e.g. "(6x²+x-12)/(2x²-9x+10) is equivalent to (3x+a)/(x+b) for what value of a+b?"), you MUST construct it by starting from the TARGET simplified form, picking its constants first, then multiplying/expanding OUTWARD to build the original complex expression — so the identity is true by construction.
 10. Strict Linearity / Degree Adherence: If the skill is "Linear equations" (in one or two variables), all equations MUST be strictly degree 1 (e.g., Ax + By = C or y = mx + b). NEVER introduce degree-2, degree-4, or substitution polynomials (like u = x^2) into linear equation items.
+11. Physical Realism Constraint: In any word problem involving physical quantities (weight, length, time, cost, count of items, speed, shipment mass, volume, age), the solution MUST be strictly positive (x > 0) and physically plausible.
+12. Backward Construction Execution: Obey the assigned REVERSE-CONSTRUCTION TARGET value above. Design the left and right expressions so that substituting the assigned target produces exact equality with zero sign or fraction errors.
+13. Single Consistent Constraint Rule: If a problem combines multiple algebraic/geometric clues (e.g. an intercept AND an equation), they MUST share the exact same root. NEVER define two separate, conflicting formulas for the same variable.
 ` : '';
 
 
@@ -787,7 +834,7 @@ Specifications:
 - Skill: ${params.skill}
 ${difficultyLine}
 ${topicLine}${params.studentLevel ? `- Student Level: ${params.studentLevel}` : ''}
-${graphSection}${mathDiversitySection}${universalNoEmbeddedChoicesRule}${exemplarHeader}`;
+${mathTargetSection}${graphSection}${mathDiversitySection}${universalNoEmbeddedChoicesRule}${exemplarHeader}`;
 
   return await callClaudeWithTool<ScenarioDraft>(
     systemPrompt,
