@@ -1,0 +1,6 @@
+{
+  "name": "SATPrep Agent Pipeline",
+  "description": "A test-agnostic high-quality question generation and validation pipeline featuring multi-pass generation, independent rubric validation, similarity checking, and human review.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

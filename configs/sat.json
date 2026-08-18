@@ -1,0 +1,158 @@
+{
+  "exam_type": "SAT",
+  "name": "Digital SAT",
+  "description": "College Board Digital SAT exam testing Reading & Writing and Math.",
+  "sections": [
+    {
+      "name": "Reading and Writing",
+      "question_formats": [
+        "MCQ 4-option"
+      ],
+      "domains": [
+        {
+          "name": "Craft and Structure",
+          "skills": [
+            "Words in Context",
+            "Text Structure and Purpose",
+            "Cross-Text Connections"
+          ]
+        },
+        {
+          "name": "Information and Ideas",
+          "skills": [
+            "Central Ideas and Details",
+            "Command of Evidence",
+            "Inferences"
+          ]
+        },
+        {
+          "name": "Expression of Ideas",
+          "skills": [
+            "Rhetorical Synthesis",
+            "Transitions"
+          ]
+        },
+        {
+          "name": "Standard English Conventions",
+          "skills": [
+            "Boundaries",
+            "Form, Structure, and Sense"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Math",
+      "question_formats": [
+        "MCQ 4-option",
+        "Student-Produced Response"
+      ],
+      "domains": [
+        {
+          "name": "Algebra",
+          "skills": [
+            "Linear equations in one variable",
+            "Linear equations in two variables",
+            "Linear functions",
+            "Systems of two linear equations"
+          ]
+        },
+        {
+          "name": "Advanced Math",
+          "skills": [
+            "Equivalent expressions",
+            "Nonlinear equations in one variable",
+            "Nonlinear functions"
+          ]
+        },
+        {
+          "name": "Problem-Solving and Data Analysis",
+          "skills": [
+            "Ratios, rates, and proportional relationships",
+            "One-variable data distributions",
+            "Two-variable data models",
+            "Probability and conditional probability"
+          ]
+        },
+        {
+          "name": "Geometry and Trigonometry",
+          "skills": [
+            "Area and volume",
+            "Lines, angles, and triangles",
+            "Right triangles and trigonometry",
+            "Circles"
+          ]
+        }
+      ]
+    }
+  ],
+  "difficulty_scale": [
+    {
+      "label": "Easy",
+      "definition": "Direct, single-step questions testing fundamental rules or clear facts. Solvable in under 30 seconds by a student who knows the underlying rule."
+    },
+    {
+      "label": "Medium",
+      "definition": "Multi-step questions requiring analytical interpretation, simple translation, or combining 2-3 rules. Solvable in about 60-75 seconds with no unusual insight required."
+    },
+    {
+      "label": "Hard",
+      "definition": "Calibrated to the hardest ~10% of REAL Digital SAT questions (Math: the last 1-2 questions of a module) \u2014 NOT competition math or graduate-level content. A Hard question requires the student to synthesize 2-3 skills from the SAME curriculum used for Easy/Medium (Algebra I/II, Geometry, basic trig, stats \u2014 no calculus, no obscure theorems), spot a non-obvious first step, translate an unusually wordy or abstractly-framed scenario, or eliminate deliberately close/high-nuance distractors. It must remain solvable by a well-prepared high schooler in roughly 90-120 seconds by hand or with a basic calculator, using clean-ish numbers (no need for a page of algebra or ugly fractions/decimals). Difficulty must come from the REASONING/INSIGHT required, not from added computational grind, unfamiliar vocabulary/notation, extra variables for their own sake, or content outside the standard SAT Math curriculum."
+    }
+  ],
+  "style_rules": [
+    "Do not duplicate real official College Board questions or passages.",
+    "For Reading & Writing: Passages must be dense, scholarly, elevated high-school/undergraduate academic standard, between 50-150 words.",
+    "Passage Introductions: Every Reading & Writing passage MUST begin with a 1-line context introduction (e.g. 'The following excerpt is adapted from...', 'The following passage is from a 2022 study by...').",
+    "Table Context: Any table-based stimulus must begin with a descriptive introductory sentence (e.g. 'The table below presents data on...').",
+    "Sentence Introductions: Avoid repetitive stems like 'Scientists say' or 'Researchers say'. Use diverse academic openings (e.g. 'A team of evolutionary biologists...', 'In a seminal 2021 study...', 'Literary scholars analyzing...').",
+    "Formal Analytical Language: Never use subjective phrasing like 'The author says'. Use objective academic verbs: 'The author argues...', 'The passage suggests...', 'The text indicates...', 'The researchers contend...'.",
+    "Natural Blank Positioning: Spread fill-in-the-blank positions naturally throughout the passage rather than restricting them to the final sentence.",
+    "Name Diversity: Use character and researcher names from diverse global ethnic backgrounds. Avoid repeating names across questions.",
+    "Distractor Calibration: Easy (1 clear wrong, 2 plausible distant traps), Medium (high-plausibility traps based on partial text or scope shift), Hard (subtle verbatim-keyword traps asserting unstated or inverted claims)."
+  ],
+  "validation_rubric": {
+    "min_composite_score": 90,
+    "zero_tolerance_checks": [
+      "correctness",
+      "originality"
+    ],
+    "checks": [
+      {
+        "id": "correctness",
+        "description": "Is the marked correct answer mathematically or textually verified as 100% accurate?",
+        "weight": 25
+      },
+      {
+        "id": "distractor_quality",
+        "description": "Are distractors realistic, non-obvious, difficulty-calibrated, and free of secondary defensible answers?",
+        "weight": 20
+      },
+      {
+        "id": "clarity",
+        "description": "Is the text grammatical, formal, free of informal/subjective phrasing ('says', 'thinks'), and completely unambiguous?",
+        "weight": 15
+      },
+      {
+        "id": "difficulty_alignment",
+        "description": "Does the complexity match the requested easy/medium/hard definition?",
+        "weight": 10
+      },
+      {
+        "id": "domain_skill_alignment",
+        "description": "Does the question test the selected domain and skill specifically?",
+        "weight": 15
+      },
+      {
+        "id": "originality",
+        "description": "Does the question stand alone without copying existing bank items or copyrighted sources?",
+        "weight": 10
+      },
+      {
+        "id": "bias_sensitivity",
+        "description": "Is the question free of cultural, regional, socio-economic biases, and uses diverse multicultural representation?",
+        "weight": 5
+      }
+    ]
+  }
+}
