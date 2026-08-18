@@ -19,6 +19,7 @@
 import { getSystemPromptForRequest, Subject, Difficulty } from '../prompts/promptSelector';
 import { retrieveExemplarQuestionsForGeneration } from '../rag/ragSystem';
 import { assembleChoices, getAI } from './generatorAgent';
+import getLangfuse from '../langfuse';
 
 const GENERATOR_MODEL = 'claude-sonnet-5';
 
@@ -139,7 +140,6 @@ export async function generateQuestionSingleCall(params: GenerateQuestionParams)
   const response = await getAI().messages.create({
     model: GENERATOR_MODEL,
     max_tokens: 8192, // covers draft + solve + distractors in one output; raise if Hard Math truncates
-    temperature: 0.6,
     system: [
       {
         type: 'text',
@@ -160,6 +160,37 @@ export async function generateQuestionSingleCall(params: GenerateQuestionParams)
       `input=${usage.input_tokens ?? 0} output=${usage.output_tokens ?? 0} ` +
       `cache_read=${usage.cache_read_input_tokens ?? 0} cache_write=${usage.cache_creation_input_tokens ?? 0}`
     );
+
+    try {
+      const trace = getLangfuse().trace({
+        name: 'claude-question-generation-single',
+        tags: [params.examType, params.subject],
+        metadata: {
+          domain: params.domain,
+          skill: params.skill,
+          difficulty: params.difficulty,
+        },
+      });
+      const generation = trace.generation({
+        name: 'generate_full_question',
+        model: GENERATOR_MODEL,
+        input: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+      });
+      generation.end({
+        output: response,
+        usageDetails: {
+          input: usage.input_tokens ?? 0,
+          output: usage.output_tokens ?? 0,
+          cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+          cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+        },
+      });
+    } catch (e) {
+      // Non-blocking observability
+    }
   }
 
   const toolUse = response.content.find((block) => block.type === 'tool_use');

@@ -17,7 +17,10 @@ import getLangfuse from "./src/server/langfuse";
 // paid the full Atlas connection handshake, which is what made the question
 // count look slow to load right after localhost started.
 getDb()
-  .then(() => console.log('[MongoDB] Connection warmed at startup.'))
+  .then(() => {
+    console.log('[MongoDB] Connection warmed at startup.');
+    console.log(`[Generator] Mode: ${process.env.USE_SINGLE_CALL_GENERATOR === 'true' ? '⚡ Single-Call Generator (Fast, 1 Claude call)' : '3-Call Sequential Generator'}`);
+  })
   .catch(err => console.error('[MongoDB] Startup connection failed:', err));
 
 // All questions are already embedded in Qdrant. No batch-by-batch indexing

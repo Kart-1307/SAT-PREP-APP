@@ -28,6 +28,7 @@ export interface ValidationBlock {
   revised_suggestion?: string;
   timestamp?: string;
   independent_derivation?: string;
+  validator_tier?: "groq" | "gemini" | "gemini_arbitrated" | "simulated";
 }
 
 export interface QuestionMetadata {
@@ -147,6 +148,7 @@ export interface ValidationAuditLog {
   checks: CheckResult;
   feedback: string;
   timestamp: string;
+  validator_tier?: "groq" | "gemini" | "gemini_arbitrated" | "simulated";
 }
 
 // ─── Batch Generation Types (exam-agnostic) ──────────────────────────────────

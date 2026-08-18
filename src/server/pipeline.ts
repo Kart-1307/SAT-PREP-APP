@@ -10,11 +10,10 @@ import { generateQuestionSingleCall } from './agents/singleCallGeneratorAgent';
 // Feature flag: set USE_SINGLE_CALL_GENERATOR=true in .env/.env.local to
 // switch question generation from the old 3-Claude-call pipeline
 // (generateScenarioDraft -> solveScenario -> generateWrongChoices) to the
-// new 1-call path (generateQuestionSingleCall). Defaults to the OLD 3-call
-// path so nothing changes until you explicitly opt in — flip the env var
-// back to compare cost/latency/quality side by side.
-const USE_SINGLE_CALL_GENERATOR = process.env.USE_SINGLE_CALL_GENERATOR === 'true';
-console.log(`[DEBUG] USE_SINGLE_CALL_GENERATOR raw value = ${JSON.stringify(process.env.USE_SINGLE_CALL_GENERATOR)}, resolved flag = ${USE_SINGLE_CALL_GENERATOR}`);
+// new 1-call path (generateQuestionSingleCall).
+export function isSingleCallGeneratorEnabled(): boolean {
+  return process.env.USE_SINGLE_CALL_GENERATOR === 'true';
+}
 import { runValidatorAgent } from './agents/validatorAgent';
 import { runMathSanityCheck } from './mathSanityCheck';
 import { cleanQuestionText } from './formatter';
@@ -972,7 +971,7 @@ export async function runOrchestrationPipeline(params: {
         const difficultyDefinition = (config?.difficulty_scale || [])
           .find((d: { label: string; definition: string }) => d.label === difficulty)?.definition;
 
-        if (USE_SINGLE_CALL_GENERATOR) {
+        if (isSingleCallGeneratorEnabled()) {
           // NEW: 1 Claude call instead of 3. generateQuestionSingleCall()
           // doesn't emit its own onStep progress events the way
           // runGeneratorAgent() does, so we bookend it manually here to
@@ -1174,11 +1173,13 @@ export async function runOrchestrationPipeline(params: {
       generation_attempt: currentAttempt,
       checks: validationBlock.checks,
       feedback: validationBlock.feedback,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
+      validator_tier: validationBlock.validator_tier,
     };
     await Database.addAuditLog(auditLog);
 
-    await addLog("validate", `Validation Complete (Attempt ${currentAttempt}): STATUS = ${validationBlock.validation_status}, SCORE = ${validationBlock.accuracy_score}/100.`);
+    const tierInfo = validationBlock.validator_tier ? ` [${validationBlock.validator_tier.toUpperCase()}]` : "";
+    await addLog("validate", `Validation Complete (Attempt ${currentAttempt})${tierInfo}: STATUS = ${validationBlock.validation_status}, SCORE = ${validationBlock.accuracy_score}/100.`);
 
     const finalCompleteness = checkQuestionCompleteness(draftQuestion);
 

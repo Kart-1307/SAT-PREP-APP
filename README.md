@@ -11,7 +11,7 @@ An AI-powered SAT question generation pipeline. A multi-agent system drafts, val
 | **Frontend** | React 19, TypeScript, Tailwind CSS v4, Vite 6, Lucide React, Motion |
 | **Backend** | Node.js, Express 4, TSX (runtime TypeScript) |
 | **AI Generation** | Anthropic Claude API (`@anthropic-ai/sdk`) — model: `claude-sonnet-4-6` |
-| **AI Validation** | Google Gemini API (`@google/genai` v2) — independent scoring/rubric pass |
+| **AI Validation** | Two-Tier Cascade: Groq API (`groq-sdk`, `llama-3.3-70b-versatile`) as Tier-1 fast validator + Google Gemini API (`@google/genai` v2) as Tier-2 arbitrator |
 | **Embeddings** | Google Gemini Embedding API (`gemini-embedding-2-preview`, 768 dimensions) |
 | **Vector DB** | Qdrant Cloud — stores embedded question bank for semantic RAG retrieval |
 | **Database** | MongoDB Atlas — stores generated questions, audit logs, pipeline runs, RAG tracking |
@@ -20,7 +20,7 @@ An AI-powered SAT question generation pipeline. A multi-agent system drafts, val
 | **Math Validation** | mathjs — deterministic equation verification without AI |
 | **PDF (scripts)** | pdfkit, pdf-parse, pdfjs-dist — reference scripts only, not part of main pipeline |
 
-> **Note on the model split:** the **generator** runs on Claude; the **validator and all embeddings** (RAG indexing, RAG retrieval, and the post-generation similarity check) stay on Gemini. Anthropic has no embeddings endpoint, so vector search cannot move to Claude — only the generation step can.
+> **Note on the model split:** the **generator** runs on Claude; the **validator** runs on a two-tier cascade (Groq Tier 1 $\rightarrow$ Gemini Tier 2 arbitrator); and **all embeddings** (RAG indexing, RAG retrieval, and similarity checks) use Gemini.
 
 ---
 
@@ -28,7 +28,8 @@ An AI-powered SAT question generation pipeline. A multi-agent system drafts, val
 
 - Node.js 18+
 - An [Anthropic API key](https://console.anthropic.com/) — used by the question generator (`claude-sonnet-4-6`)
-- A [Gemini API key](https://aistudio.google.com/) — used by the validator and all embeddings
+- A [Groq API key](https://console.groq.com/) (Free tier) — used as Tier-1 primary fast validator (`llama-3.3-70b-versatile`)
+- A [Gemini API key](https://aistudio.google.com/) — used as Tier-2 arbitrator and all embeddings
 - A [Qdrant Cloud](https://cloud.qdrant.io/) cluster (free tier)
 - A [MongoDB Atlas](https://www.mongodb.com/cloud/atlas) cluster (free tier)
 - A Firebase project with Authentication enabled
@@ -62,7 +63,8 @@ Create `.env.local` in the project root:
 
 # AI providers
 ANTHROPIC_API_KEY="MY_ANTHROPIC_API_KEY"          # Claude (claude-sonnet-4-6) — question generator
-GEMINI_API_KEY="MY_GEMINI_API_KEY"                # Gemini — embeddings / RAG
+GROQ_API_KEY="gsk_..."                             # Groq (llama-3.3-70b-versatile) — Tier-1 Fast Validator
+GEMINI_API_KEY="MY_GEMINI_API_KEY"                # Gemini — Tier-2 Arbitrator & Embeddings / RAG
 
 # Optional: separate key for the validator (falls back to GEMINI_API_KEY if unset)
 VALIDATOR_GEMINI_API_KEY="MY_VALIDATOR_GEMINI_API_KEY"
